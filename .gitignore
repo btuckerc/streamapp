@@ -1,0 +1,17 @@
+.build/
+.local/
+StreamApp.app/
+.DS_Store
+__pycache__/
+*.mkv
+*.flv
+*.mp4
+*.key
+.env*
+Research/
+*.zip
+*.dmg
+*.p12
+*.p8
+*.mobileprovision
+.swiftpm/
