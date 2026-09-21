@@ -112,14 +112,13 @@ info = {
     'CFBundleName': 'StreamApp', 'CFBundleDisplayName': 'StreamApp',
     'CFBundleIdentifier': 'dev.streamapp.studio', 'CFBundleExecutable': 'StreamApp',
     'CFBundlePackageType': 'APPL',
-    'CFBundleShortVersionString': a.version if a.release else '1.1.1',
-    'CFBundleVersion': a.build_number if a.release else '5',
+    'CFBundleShortVersionString': a.version if a.release else '1.2.0',
+    'CFBundleVersion': a.build_number if a.release else '6',
     'CFBundleIconFile': 'StreamApp.icns',
     'LSMinimumSystemVersion': '26.0', 'LSUIElement': True, 'NSHighResolutionCapable': True,
     'NSCameraUsageDescription': 'StreamApp uses the camera you enable in your broadcast layout.',
     'NSMicrophoneUsageDescription': 'StreamApp mixes the microphone you enable into recordings and broadcasts.',
     'NSScreenCaptureUsageDescription': 'StreamApp captures only the display or window you select for your session.',
-    'NSAppleEventsUsageDescription': 'StreamApp temporarily adjusts Dock size and auto-hide through System Events when you enable Fit 16:9.',
     'NSCameraUseContinuityCameraDeviceType': True,
 }
 (staging / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
@@ -127,7 +126,7 @@ entitlements = ROOT / '.build/StreamApp.entitlements.plist'
 
 copied = {}
 queue = [macos / 'StreamApp', macos / 'ffmpeg']
-entitlement_values = {'com.apple.security.device.camera': True, 'com.apple.security.device.audio-input': True, 'com.apple.security.automation.apple-events': True}
+entitlement_values = {'com.apple.security.device.camera': True, 'com.apple.security.device.audio-input': True}
 if a.identity == '-':
     # Ad-hoc signatures have no shared Team ID. Developer ID builds keep validation.
     entitlement_values['com.apple.security.cs.disable-library-validation'] = True

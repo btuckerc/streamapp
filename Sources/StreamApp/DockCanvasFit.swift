@@ -1,6 +1,4 @@
-import AppKit
-import ApplicationServices
-import Combine
+
 import SwiftUI
 
 struct DockCaptureRegion: Equatable {
@@ -24,11 +22,13 @@ final class DockCanvasFit: ObservableObject {
         let displayID: UInt32
         let originalSize: Double
         var appliedSize: Double
-        // Optional only to recover journals written by the previous release.
-        var originalControl: Double?
+        var originalAutohide: Bool?
+        var originalReservedHeight: Double?
+        var pendingSize: Double?
+        var recovering: Bool?
+        // Decode interrupted journals from the System Events implementation.
         var appliedControl: Double?
         var pendingControl: Double?
-        var originalAutohide: Bool?
     }
     private struct Measurement: Equatable {
         let frame: CGRect
@@ -56,7 +56,7 @@ final class DockCanvasFit: ObservableObject {
         desktop.layout = .desktopChat
         let slot = SceneGeometry(configuration: desktop).desktop
         desktopAspect = slot.width / slot.height
-        if let id = saved?.displayID, let measured = measurement(id) { publish(measured, displayID: id) }
+        if saved?.recovering != true, let id = saved?.displayID, let measured = measurement(id) { publish(measured, displayID: id) }
     }
 
     nonisolated static func targetReservedHeight(frame: CGRect, desktopAspect: Double) -> Double {
@@ -67,43 +67,23 @@ final class DockCanvasFit: ObservableObject {
         guard !busy, saved == nil else { return }
         CFPreferencesAppSynchronize(domain)
         guard (CFPreferencesCopyAppValue("orientation" as CFString, domain) as? String ?? "bottom") == "bottom",
-              NSScreen.screens.contains(where: { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == displayID }),
-              let original = size() else {
+              let screen = screen(displayID), let original = size() else {
             throw EngineError.message("Use a bottom Dock on an available display first.")
         }
         busy = true; message = nil; externallyChanged = false
         defer { busy = false }
-        let originalControl = try control(allowPrompt: true)
-        let originalAutohide = try autohide(allowPrompt: true)
-        saved = Saved(displayID: displayID, originalSize: original, appliedSize: original, originalControl: originalControl, appliedControl: originalControl, originalAutohide: originalAutohide)
+        let reserved = screen.visibleFrame.minY - screen.frame.minY
+        saved = Saved(displayID: displayID, originalSize: original, appliedSize: original,
+                      originalAutohide: autohide(), originalReservedHeight: reserved)
         do { try save() } catch { saved = nil; throw error }
         self.displayID = displayID
         defer { if saved != nil { startMonitor() } }
         do {
-            if originalAutohide {
-                try setAutohide(false, allowPrompt: true)
-            }
-            // Showing the Dock can change its layout and normalize its size.
-            // Wait for two equal visible measurements, not merely the first frame.
-            var previous: Measurement?
-            for _ in 0..<5 {
-                try await Task.sleep(for: .milliseconds(200))
-                let current = measurement(displayID)
-                if let current, current == previous { break }
-                previous = current
-            }
-            guard measurement(displayID) != nil else {
-                throw EngineError.message("Move the Dock to the selected display before fitting it.")
-            }
-            if originalAutohide {
-                guard let applied = size() else {
-                    throw EngineError.message("Cannot read the visible Dock size. Its previous settings are saved.")
-                }
-                saved!.appliedSize = applied
-                saved!.appliedControl = try control(allowPrompt: true)
-                try save()
-            }
-            try await adjust(allowPrompt: true)
+            let target = Self.targetReservedHeight(frame: screen.frame, desktopAspect: desktopAspect)
+            let candidate = target == 0 ? 16 : min(128, max(16, (original + target - reserved).rounded()))
+            // Commit size and visibility together, not as separate work-area transitions.
+            try await apply(size: candidate, autohide: false)
+            try await adjust()
         } catch {
             let failure = error
             try await restoreSaved()
@@ -118,65 +98,53 @@ final class DockCanvasFit: ObservableObject {
         try await restoreSaved()
     }
 
-    private func restoreSize(_ value: Saved) async throws {
-        guard let current = size() else { throw EngineError.message("Cannot read the Dock size. Its saved size is retained.") }
-        var ownsSize = abs(current - value.appliedSize) < 0.1
-        if !externallyChanged, value.appliedControl != nil || value.pendingControl != nil {
-            let actualControl = try control(allowPrompt: true)
-            ownsSize = value.appliedControl.map { abs($0 - actualControl) < 0.001 } == true
-                || value.pendingControl.map { abs($0 - actualControl) <= 1.0 / 112 + 0.000001 } == true
-        }
-        if !externallyChanged && ownsSize {
-            if let original = value.originalControl {
-                saved!.pendingControl = original
-                try save()
-                try setControl(original, allowPrompt: true)
-                try await Task.sleep(for: .milliseconds(350))
-            }
-            if size().map({ abs($0 - value.originalSize) >= 0.1 }) ?? true {
-                // The normalized float can round down on write. Recover the
-                // exact saved tile size, including for older tile-only journals.
-                var low = 0.0, high = 1.0
-                for _ in 0..<14 {
-                    let middle = (low + high) / 2
-                    saved!.pendingControl = middle
-                    try save()
-                    try setControl(middle, allowPrompt: true)
-                    try await Task.sleep(for: .milliseconds(100))
-                    guard let actual = size() else { break }
-                    if abs(actual - value.originalSize) < 0.1 { break }
-                    if actual < value.originalSize { low = middle } else { high = middle }
-                }
-            }
-            guard let actual = size(), abs(actual - value.originalSize) < 0.1 else {
-                throw EngineError.message("The saved Dock size could not be restored. The recovery journal was kept.")
-            }
-            message = "Previous Dock size restored."
-        } else {
-            message = "Kept the Dock size you changed outside StreamApp."
-        }
-    }
-
     private func restoreSaved() async throws {
         guard let value = saved else { return }
-        var sizeFailure: Error?
-        do { try await restoreSize(value) } catch { sizeFailure = error }
-        // Restore visibility independently, including after a failed size restore.
-        // True is a newer/manual hidden state: never turn it back off on exit.
-        if let original = value.originalAutohide {
-            let current = try autohide(allowPrompt: true)
-            if !current && original {
-                try setAutohide(true, allowPrompt: true)
-                guard try autohide(allowPrompt: true) else {
-                    throw EngineError.message("Dock auto-hide could not be restored. The recovery journal was kept.")
+        guard let current = size() else {
+            throw EngineError.message("Cannot read the Dock size. Its recovery journal was kept.")
+        }
+        let restoreSize = !externallyChanged && ownsSize(current, value)
+        saved!.recovering = true
+        try save()
+        region = nil
+        // A newer manually hidden Dock stays hidden. Legacy size-only journals
+        // leave visibility untouched. Restore exact pixels, without slider rounding.
+        try await apply(size: restoreSize ? value.originalSize : nil,
+                        autohide: value.originalAutohide == true ? true : nil)
+        if restoreSize, size().map({ abs($0 - value.originalSize) < 0.1 }) != true {
+            throw EngineError.message("The saved Dock size could not be restored. The recovery journal was kept.")
+        }
+        if autohide() {
+            let baseline = value.originalAutohide == true ? (value.originalReservedHeight ?? 0) : 0
+            var released = false
+            for _ in 0..<50 {
+                guard let screen = screen(value.displayID) else {
+                    // A disconnected display has no remaining work-area reservation.
+                    released = true
+                    break
                 }
-                message = (message ?? "Dock recovery pending.") + " Previous auto-hide setting restored."
+                if screen.visibleFrame.minY - screen.frame.minY <= baseline + 1 {
+                    released = true
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(200))
+            }
+            guard released else {
+                throw EngineError.message("The Dock settings are restored, but macOS has not released its desktop space. Restore remains available; the recovery journal was kept.")
             }
         }
-        if let sizeFailure { throw sizeFailure }
         try FileManager.default.removeItem(at: backupURL)
         saved = nil; displayID = nil; region = nil
         monitor?.cancel(); monitor = nil; lastMeasurement = nil
+        message = restoreSize ? "Previous Dock settings and desktop space restored." : "Kept your newer Dock size. Previous visibility restored."
+    }
+
+    private func ownsSize(_ current: Double, _ value: Saved) -> Bool {
+        if abs(current - value.appliedSize) < 0.1 { return true }
+        if let pending = value.pendingSize, abs(current - pending) < 0.1 { return true }
+        let control = (current - 16) / 112
+        return value.appliedControl.map { abs(control - $0) < 0.001 } == true
+            || value.pendingControl.map { abs(control - $0) <= 1.0 / 112 + 0.000001 } == true
     }
 
     private func startMonitor() {
@@ -191,6 +159,10 @@ final class DockCanvasFit: ObservableObject {
 
     private func refresh() async {
         guard !busy, let value = saved else { return }
+        guard value.recovering != true else {
+            message = "Dock restoration is pending. Use Restore previous Dock settings to finish."
+            return
+        }
         guard let measured = measurement(value.displayID) else {
             region = nil
             message = "Fit needs a visible bottom Dock on its selected display. Your saved size is retained."
@@ -198,71 +170,47 @@ final class DockCanvasFit: ObservableObject {
             return
         }
         publish(measured, displayID: value.displayID)
-        if let current = size(), abs(current - value.appliedSize) >= 0.1 {
-            do {
-                let actualControl = try control(allowPrompt: false)
-                if value.appliedControl.map({ abs($0 - actualControl) < 0.001 }) == true
-                    || value.pendingControl.map({ abs($0 - actualControl) <= 1.0 / 112 + 0.000001 }) == true {
-                    saved!.appliedSize = current
-                    saved!.appliedControl = actualControl; saved!.pendingControl = nil
-                    try save()
-                } else {
-                    externallyChanged = true
-                    message = "Your newer Dock size is kept. Capture still follows the area above it."
-                }
-            } catch { message = error.localizedDescription; return }
+        if let current = size(), !ownsSize(current, value) {
+            externallyChanged = true
+            message = "Your newer Dock size is kept. Capture still follows the area above it."
         }
         guard measured != lastMeasurement else { return }
         lastMeasurement = measured
         guard !externallyChanged else { return }
         busy = true
         defer { busy = false }
-        do { try await adjust(allowPrompt: false) }
+        do { try await adjust() }
         catch { message = error.localizedDescription }
     }
 
-    private func adjust(allowPrompt: Bool) async throws {
+    private func adjust() async throws {
         guard let id = saved?.displayID else { return }
         var previousHeight: Double?
-        for _ in 0..<4 {
+        for _ in 0..<3 {
             guard let measured = measurement(id) else { break }
             publish(measured, displayID: id)
             let target = Self.targetReservedHeight(frame: measured.frame, desktopAspect: desktopAspect)
             let error = target - measured.reserved
             if abs(error) <= 1 || previousHeight == measured.reserved { break }
-            let current = try control(allowPrompt: allowPrompt)
-            // Feedback, not a promise that the slider maps linearly to height.
-            // macOS may cap physical height to fit all running/Handoff items.
-            let next = min(1, max(0, current + error / 112))
-            if abs(next - current) < 0.001 { break }
-            guard let tile = size(), abs(tile - saved!.appliedSize) < 0.1 else {
+            guard let current = size(), let value = saved, ownsSize(current, value) else {
                 externallyChanged = true
                 throw EngineError.message("The Dock size changed elsewhere. Your newer setting was kept.")
             }
+            let next = target == 0 ? 16 : min(128, max(16, (current + error).rounded()))
+            if abs(next - current) < 0.1 { break }
             previousHeight = measured.reserved
-            saved!.pendingControl = next
-            try save()
-            try setControl(next, allowPrompt: allowPrompt)
-            try await Task.sleep(for: .milliseconds(350))
-            // System Events may quantize/clamp the requested value. This is our
-            // write, not evidence of a user override. Compare subsequent changes
-            // against the accepted readback instead of the requested float.
-            let accepted = try control(allowPrompt: false)
-            guard let applied = size() else {
-                throw EngineError.message("Cannot read the adjusted Dock size. Its previous settings are saved.")
-            }
-            saved!.appliedSize = applied
-            saved!.appliedControl = accepted; saved!.pendingControl = nil
-            try save()
+            try await apply(size: next, autohide: nil)
         }
-        if let measured = measurement(id) {
-            publish(measured, displayID: id)
-            lastMeasurement = measured
-            message = nil
+        guard let measured = measurement(id) else {
+            throw EngineError.message("macOS has not reported the fitted Dock’s capture boundary on the selected display. Your previous settings are saved.")
         }
+        publish(measured, displayID: id)
+        lastMeasurement = measured
+        message = nil
     }
 
     private func publish(_ measured: Measurement, displayID: UInt32) {
+        guard measured.reserved > 0 else { return }
         let next = DockCaptureRegion(displayID: displayID, heightFraction: (measured.frame.height - measured.reserved) / measured.frame.height)
         if region != next { region = next }
     }
@@ -271,10 +219,29 @@ final class DockCanvasFit: ObservableObject {
         CFPreferencesAppSynchronize(domain)
         guard (CFPreferencesCopyAppValue("orientation" as CFString, domain) as? String ?? "bottom") == "bottom",
               !(CFPreferencesCopyAppValue("autohide" as CFString, domain) as? Bool ?? false),
-              let screen = NSScreen.screens.first(where: { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == id }) else { return nil }
+              let screen = screen(id) else { return nil }
         let reserved = screen.visibleFrame.minY - screen.frame.minY
-        guard reserved > 0, reserved < screen.frame.height else { return nil }
+        guard reserved > 0, reserved < screen.frame.height, dockIsOnDisplay(id) else { return nil }
         return Measurement(frame: screen.frame, reserved: reserved, aspect: desktopAspect)
+    }
+
+    private func dockIsOnDisplay(_ id: UInt32) -> Bool {
+        guard let dock = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first,
+              let windows = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]] else { return false }
+        let display = CGDisplayBounds(id)
+        let dockLevel = CGWindowLevelForKey(.dockWindow)
+        return windows.contains { window in
+            guard (window[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == dock.processIdentifier,
+                  (window[kCGWindowLayer as String] as? NSNumber)?.int32Value == dockLevel,
+                  let bounds = window[kCGWindowBounds as String] as? [String: Any],
+                  let frame = CGRect(dictionaryRepresentation: bounds as CFDictionary),
+                  !frame.isEmpty, !frame.isInfinite, !frame.isNull else { return false }
+            return display.contains(CGPoint(x: frame.midX, y: frame.midY))
+        }
+    }
+
+    private func screen(_ id: UInt32) -> NSScreen? {
+        NSScreen.screens.first { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == id }
     }
 
     private func size() -> Double? {
@@ -287,31 +254,61 @@ final class DockCanvasFit: ObservableObject {
         try JSONEncoder().encode(saved).write(to: backupURL, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: backupURL.path)
     }
-    private func script(_ command: String, allowPrompt: Bool) throws -> NSAppleEventDescriptor {
-        if !allowPrompt {
-            let target = NSAppleEventDescriptor(bundleIdentifier: "com.apple.systemevents")
-            guard AEDeterminePermissionToAutomateTarget(target.aeDesc, typeWildCard, typeWildCard, false) == noErr else {
-                throw EngineError.message("Allow StreamApp to control System Events to automatically fit the Dock. Capture continues without resizing it.")
+    private func autohide() -> Bool {
+        CFPreferencesAppSynchronize(domain)
+        return CFPreferencesCopyAppValue("autohide" as CFString, domain) as? Bool ?? false
+    }
+
+    private func apply(size requestedSize: Double?, autohide requestedAutohide: Bool?) async throws {
+        guard let dock = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first else {
+            throw EngineError.message("The Dock is not running. Its previous settings are saved.")
+        }
+        if let requestedSize {
+            saved!.pendingSize = requestedSize
+            try save()
+            CFPreferencesSetAppValue("tilesize" as CFString, NSNumber(value: requestedSize), domain)
+        }
+        if let requestedAutohide {
+            CFPreferencesSetAppValue("autohide" as CFString, NSNumber(value: requestedAutohide), domain)
+        }
+        guard CFPreferencesAppSynchronize(domain) else {
+            throw EngineError.message("macOS could not save the Dock settings. The recovery journal was kept.")
+        }
+        // The original preference-write/SIGTERM mechanism, not an app-quit request.
+        guard kill(dock.processIdentifier, SIGTERM) == 0 else {
+            throw EngineError.message("macOS could not restart the Dock. The recovery journal was kept.")
+        }
+        var restarted = false
+        for _ in 0..<50 {
+            try await Task.sleep(for: .milliseconds(200))
+            if let replacement = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first,
+               replacement.processIdentifier != dock.processIdentifier {
+                restarted = true
+                break
             }
         }
-        var error: NSDictionary?
-        let result = NSAppleScript(source: "tell application \"System Events\" to \(command)")!.executeAndReturnError(&error)
-        if error != nil { throw EngineError.message("Dock sizing needs Automation access to System Events. Allow it in System Settings → Privacy & Security → Automation, then try again.") }
-        return result
-    }
-    private func control(allowPrompt: Bool) throws -> Double {
-        let value = try script("get dock size of dock preferences", allowPrompt: allowPrompt).doubleValue
-        guard value.isFinite, (0...1).contains(value) else { throw EngineError.message("macOS returned an invalid Dock size.") }
-        return value
-    }
-    private func setControl(_ value: Double, allowPrompt: Bool) throws {
-        _ = try script("set dock size of dock preferences to \(value)", allowPrompt: allowPrompt)
-    }
-    private func autohide(allowPrompt: Bool) throws -> Bool {
-        try script("get autohide of dock preferences", allowPrompt: allowPrompt).booleanValue
-    }
-    private func setAutohide(_ enabled: Bool, allowPrompt: Bool) throws {
-        _ = try script("set autohide of dock preferences to \(enabled ? "true" : "false")", allowPrompt: allowPrompt)
+        guard restarted else { throw EngineError.message("The Dock has not restarted. Its previous settings remain saved.") }
+        // Dock startup and work-area publication are separate events.
+        try await Task.sleep(for: .milliseconds(1500))
+        if let requestedSize {
+            guard let accepted = size(), abs(accepted - requestedSize) < 0.1 else {
+                throw EngineError.message("The Dock size changed during adjustment. The recovery journal was kept.")
+            }
+            saved!.appliedSize = accepted
+            saved!.pendingSize = nil
+            saved!.appliedControl = nil; saved!.pendingControl = nil
+            try save()
+        }
+        if let requestedAutohide, autohide() != requestedAutohide {
+            throw EngineError.message("Dock visibility changed during adjustment. The recovery journal was kept.")
+        }
+        if saved?.recovering != true, let id = saved?.displayID {
+            for _ in 0..<50 {
+                if measurement(id) != nil { return }
+                try await Task.sleep(for: .milliseconds(200))
+            }
+            throw EngineError.message("The visible Dock has not established a capture boundary on the selected display. Its previous settings remain saved.")
+        }
     }
 }
 
@@ -336,7 +333,7 @@ struct DockFitControl: View {
                 }
             }
             .disabled(model.busy || model.engine.isRunning || fit.busy || (fit.displayID == nil && model.configuration.windowID != nil))
-            .help("Temporarily shows and resizes the Dock to fit the desktop to the scene, accounting for chat. Remembers the Dock’s previous size and auto-hide setting and restores them when turned off.")
+            .help("Temporarily shows and resizes the Dock to fit the desktop to the scene, accounting for chat. Briefly restarts Dock when applying or restoring settings; remembers its previous size and auto-hide setting.")
             if fit.busy { ProgressView("Adjusting Dock…").controlSize(.small) }
             if let text = error ?? (compact ? nil : fit.message) {
                 Text(text).font(.caption).foregroundStyle(error == nil ? Color.secondary : Color.orange)
@@ -346,7 +343,7 @@ struct DockFitControl: View {
             Button("Fit Dock") { Task { await change(true) } }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("macOS may ask you to allow StreamApp to control System Events. Fit temporarily shows and resizes the Dock, remembering its previous size and auto-hide setting. Handoff and Dock items stay untouched.")
+            Text("Fit temporarily shows and resizes the Dock, briefly restarting it to apply the desktop layout. Turning Fit off restores its previous size and auto-hide setting and waits for the desktop space to return. Handoff and Dock items stay untouched.")
         }
     }
     private func change(_ enabled: Bool) async {

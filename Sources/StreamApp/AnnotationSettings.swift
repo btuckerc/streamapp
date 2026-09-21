@@ -29,11 +29,11 @@ enum AnnotationEraseMode: String, CaseIterable, Identifiable {
 @MainActor
 final class AnnotationSettings: ObservableObject {
     static let defaultSmoothing = 0.5
-    static let defaultStrokeWidth = 4.0
+    static let defaultStrokeWidth = 6.0
     static let defaultStrokeColor = NSColor.systemRed
     static let defaultHighlighterColor = NSColor.systemYellow
     static let defaultFillColor = NSColor.clear
-    static let defaultHoldToStraighten = false
+    static let defaultHoldToStraighten = true
     static let defaultEraseMode: AnnotationEraseMode = .object
 
     @Published var smoothing: Double {

@@ -95,7 +95,26 @@ struct StudioPopover: View {
                 Picker("Position", selection: $model.configuration.cameraCorner) {
                     ForEach(CameraCorner.allCases) { Text($0.title).tag($0) }
                 }.controlSize(.small)
-                HStack { Text("Size").font(.caption); Slider(value: $model.configuration.cameraSize, in: 0.12...0.4) }
+                HStack {
+                    Text("Normal size").font(.caption)
+                    Slider(value: $model.configuration.cameraSize, in: 0.12...0.4)
+                        .accessibilityLabel("Normal webcam size")
+                    Text(model.configuration.cameraSize.formatted(.percent.precision(.fractionLength(0)))).font(.caption).monospacedDigit()
+                    Button(model.configuration.cameraPunchIn ? "Punch out" : "Punch in") {
+                        model.toggleCameraPunchIn()
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(!model.canPunchInCamera)
+                    .help("Webcam punch-in (⌃⌥⌘V)")
+                    .accessibilityLabel(model.configuration.cameraPunchIn ? "Punch out webcam" : "Punch in webcam")
+                    .accessibilityHint("Keyboard shortcut Control-Option-Command-V")
+                }
+                HStack {
+                    Text("Punched-in size").font(.caption)
+                    Slider(value: $model.configuration.cameraPunchInSize, in: 0.4...0.9)
+                        .accessibilityLabel("Punched-in webcam size")
+                    Text(model.configuration.cameraPunchInSize.formatted(.percent.precision(.fractionLength(0)))).font(.caption).monospacedDigit()
+                }
             }
         }
     }
@@ -248,32 +267,37 @@ struct SceneDiagram: View {
         GeometryReader { geometry in
             let width = geometry.size.width
             let height = geometry.size.height
-            let chat = configuration.chatEnabled ? width * configuration.chatWidth / 1920 : 0
+            let sceneConfiguration: StudioConfiguration = {
+                var scene = configuration
+                scene.layout = layout
+                return scene
+            }()
+            let chat = sceneConfiguration.chatEnabled ? width * sceneConfiguration.chatWidth / 1920 : 0
             let stageWidth = width - chat
-            let stageX = configuration.chatOnLeft ? chat : 0
+            let stageX = sceneConfiguration.chatOnLeft ? chat : 0
             ZStack(alignment: .topLeading) {
                 RoundedRectangle(cornerRadius: 5).fill(Color.black.opacity(0.85))
                 if layout == .justChatting {
                     panel("person.fill", color: .indigo).frame(width: width, height: height)
-                    if !configuration.cameraEnabled { Text("CAMERA OFF").font(.system(size: 8, weight: .bold)).foregroundStyle(.white).frame(width: width, height: height) }
-                    if configuration.chatEnabled {
-                    VStack(spacing: 4) {
-                        ForEach(0..<6) { row in Capsule().fill(Color.white.opacity(row.isMultiple(of: 2) ? 0.8 : 0.4)).frame(height: 2) }
-                    }.padding(5).frame(width: chat, height: height - 10)
-                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 4))
-                        .offset(x: width - chat - 5, y: 5)
+                    if !sceneConfiguration.cameraEnabled { Text("CAMERA OFF").font(.system(size: 8, weight: .bold)).foregroundStyle(.white).frame(width: width, height: height) }
+                    if sceneConfiguration.chatEnabled {
+                        VStack(spacing: 4) {
+                            ForEach(0..<6) { row in Capsule().fill(Color.white.opacity(row.isMultiple(of: 2) ? 0.8 : 0.4)).frame(height: 2) }
+                        }.padding(5).frame(width: chat, height: height - 10)
+                            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 4))
+                            .offset(x: width - chat - 5, y: 5)
                     }
                 } else {
                     panel("display", color: .blue).frame(width: stageWidth, height: height).offset(x: stageX)
-                    if configuration.chatEnabled {
-                    VStack(spacing: 4) {
-                        ForEach(0..<6) { row in Capsule().fill(Color.white.opacity(row.isMultiple(of: 2) ? 0.45 : 0.2)).frame(height: 2) }
-                    }.padding(5).frame(width: chat, height: height).background(Color.teal.opacity(0.65)).offset(x: configuration.chatOnLeft ? 0 : stageWidth)
+                    if sceneConfiguration.chatEnabled {
+                        VStack(spacing: 4) {
+                            ForEach(0..<6) { row in Capsule().fill(Color.white.opacity(row.isMultiple(of: 2) ? 0.45 : 0.2)).frame(height: 2) }
+                        }.padding(5).frame(width: chat, height: height).background(Color.teal.opacity(0.65)).offset(x: sceneConfiguration.chatOnLeft ? 0 : stageWidth)
                     }
-                    if configuration.cameraEnabled {
-                        let cameraWidth = stageWidth * configuration.cameraSize
-                        let left = configuration.cameraCorner == .bottomLeft || configuration.cameraCorner == .topLeft
-                        let top = configuration.cameraCorner == .topLeft || configuration.cameraCorner == .topRight
+                    if sceneConfiguration.cameraEnabled {
+                        let cameraWidth = stageWidth * CGFloat(sceneConfiguration.effectiveCameraSize)
+                        let left = sceneConfiguration.cameraCorner == .bottomLeft || sceneConfiguration.cameraCorner == .topLeft
+                        let top = sceneConfiguration.cameraCorner == .topLeft || sceneConfiguration.cameraCorner == .topRight
                         panel("person.fill", color: .indigo).frame(width: cameraWidth, height: cameraWidth * 9 / 16)
                             .overlay(RoundedRectangle(cornerRadius: 4).stroke(.white.opacity(0.8), lineWidth: 1))
                             .offset(x: stageX + (left ? 5 : stageWidth - cameraWidth - 5), y: top ? 5 : height - cameraWidth * 9 / 16 - 5)
@@ -352,6 +376,8 @@ struct StudioSettings: View {
                 sourcesTab.tabItem { Label("Sources", systemImage: "display") }.tag(StudioModel.SettingsTab.sources)
                 audioTab.tabItem { Label("Audio", systemImage: "waveform") }.tag(StudioModel.SettingsTab.audio)
                 layoutTab.tabItem { Label("Layout", systemImage: "rectangle.3.group") }.tag(StudioModel.SettingsTab.layout)
+                TeleprompterControls(model: model)
+                    .tabItem { Label("Prompter", systemImage: "text.bubble") }.tag(StudioModel.SettingsTab.teleprompter)
                 drawingTab.tabItem { Label("Drawing", systemImage: "pencil.tip") }.tag(StudioModel.SettingsTab.drawing)
                 outputTab.tabItem { Label("Outputs", systemImage: "antenna.radiowaves.left.and.right") }.tag(StudioModel.SettingsTab.outputs)
             }
@@ -422,6 +448,8 @@ struct StudioSettings: View {
                     Toggle("Show StreamApp windows", isOn: $model.configuration.showStreamAppWindows).toggleStyle(.switch)
                     resetButton("Show StreamApp windows", enabled: model.configuration.showStreamAppWindows != StudioConfiguration().showStreamAppWindows) { model.configuration.showStreamAppWindows = StudioConfiguration().showStreamAppWindows }
                 }
+                Text("Teleprompter visibility is controlled separately in Prompter settings.")
+                    .font(.caption).foregroundStyle(.secondary)
             }.disabled(model.busy || model.configuration.windowID != nil)
             Section("Exclude from display capture") {
                 Text("Refresh after reopening excluded apps. Window rules last until StreamApp quits. This is not a system-wide privacy boundary.")
@@ -581,7 +609,24 @@ struct StudioSettings: View {
                         Picker("Webcam corner", selection: $model.configuration.cameraCorner) { ForEach(CameraCorner.allCases) { Text($0.title).tag($0) } }
                     }
                     setting("Webcam size", \.cameraSize) {
-                        Text("Webcam size"); Slider(value: $model.configuration.cameraSize, in: 0.12...0.4)
+                        Text("Webcam size")
+                        Slider(value: $model.configuration.cameraSize, in: 0.12...0.4)
+                            .accessibilityLabel("Normal webcam size")
+                        Text(model.configuration.cameraSize.formatted(.percent.precision(.fractionLength(0)))).monospacedDigit()
+                        Button(model.configuration.cameraPunchIn ? "Punch out" : "Punch in") {
+                            model.toggleCameraPunchIn()
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(!model.canPunchInCamera)
+                        .help("Webcam punch-in (⌃⌥⌘V)")
+                        .accessibilityLabel(model.configuration.cameraPunchIn ? "Punch out webcam" : "Punch in webcam")
+                        .accessibilityHint("Keyboard shortcut Control-Option-Command-V")
+                    }
+                    setting("Punched-in size", \.cameraPunchInSize) {
+                        Text("Punched-in size")
+                        Slider(value: $model.configuration.cameraPunchInSize, in: 0.4...0.9)
+                            .accessibilityLabel("Punched-in webcam size")
+                        Text(model.configuration.cameraPunchInSize.formatted(.percent.precision(.fractionLength(0)))).monospacedDigit()
                     }
                 }
             }.formStyle(.grouped)
@@ -721,8 +766,11 @@ struct AnnotationSettingsView: View {
             Section("Stroke style") {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack { Text("Smoothing"); Spacer(); Text(smoothingLabel).foregroundStyle(.secondary); resetButton("Smoothing", enabled: settings.smoothing != AnnotationSettings.defaultSmoothing) { settings.smoothing = AnnotationSettings.defaultSmoothing } }
-                    Slider(value: $settings.smoothing, in: 0...1).accessibilityLabel("Smoothing")
-                    HStack { Text("Off").font(.caption).foregroundStyle(.secondary); Spacer(); Text("Strong").font(.caption).foregroundStyle(.secondary) }
+                    HStack(spacing: 8) {
+                        Text("Off").font(.caption).foregroundStyle(.secondary)
+                        Slider(value: $settings.smoothing, in: 0...1).labelsHidden().accessibilityLabel("Smoothing")
+                        Text("Strong").font(.caption).foregroundStyle(.secondary)
+                    }
                 }
                 HStack { Text("Width"); Slider(value: $settings.strokeWidth, in: 1...24, step: 1).accessibilityLabel("Stroke width"); Text("\(settings.strokeWidth, specifier: "%.0f") pt").monospacedDigit(); resetButton("Stroke width", enabled: settings.strokeWidth != AnnotationSettings.defaultStrokeWidth) { settings.strokeWidth = AnnotationSettings.defaultStrokeWidth } }
                 HStack { ColorPicker("Stroke", selection: strokeColorBinding, supportsOpacity: false); resetButton("Stroke", enabled: settings.strokeColor != AnnotationSettings.defaultStrokeColor) { settings.strokeColor = AnnotationSettings.defaultStrokeColor } }
@@ -749,7 +797,7 @@ struct AnnotationSettingsView: View {
             }
             Section("Pen buttons") {
                 Text("Mappings use the standard event button number, not a physical pen position. If a driver suppresses a button, configure it to emit a click in Tablet Companion or the tablet driver first.").font(.caption).foregroundStyle(.secondary)
-                Text("Tool picker: tap for Pen/Erase; hold, hover, and release to choose a tool.").font(.caption).foregroundStyle(.secondary)
+                Text("Tool picker: tap for Pen/Erase; hold, hover, and release to choose. Colors at the top opens a palette for Stroke, Highlighter, or Fill.").font(.caption).foregroundStyle(.secondary)
                 ForEach(mappedButtons, id: \.self) { button in
                     HStack {
                         Text(buttonLabel(button))

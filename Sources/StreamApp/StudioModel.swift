@@ -7,20 +7,29 @@ import UniformTypeIdentifiers
 
 @MainActor
 final class StudioModel: ObservableObject {
-    enum SettingsTab: Hashable { case sources, audio, layout, drawing, outputs }
+    enum SettingsTab: Hashable { case sources, audio, layout, teleprompter, drawing, outputs }
     @Published var settingsTab: SettingsTab = .sources
     @Published var settingsVisible = false
     let engine = StudioEngine()
     let annotationSettings: AnnotationSettings
     let twitch: TwitchSession
+    let teleprompter: TeleprompterModel
     let dockFit = DockCanvasFit()
     @Published var configuration = StudioConfiguration() {
         didSet {
             if configuration.streamService != oldValue.streamService { message = nil }
+            if (!configuration.cameraEnabled || configuration.layout != .desktopChat) && configuration.cameraPunchIn {
+                configuration.cameraPunchIn = false
+            }
             dockFit.configure(configuration)
             if configuration.backgroundImagePath != oldValue.backgroundImagePath {
                 refreshBackgroundImageState()
             }
+            if configuration.teleprompterMode != oldValue.teleprompterMode ||
+                configuration.teleprompterInCapture != oldValue.teleprompterInCapture {
+                hideTeleprompter?()
+            }
+            teleprompter.configure(configuration)
             scheduleSave()
             scheduleUpdate()
         }
@@ -53,6 +62,18 @@ final class StudioModel: ObservableObject {
     }
     var toggleAnnotations: (() -> Void)?
     var clearAnnotations: (() -> Void)?
+    var hideTeleprompter: (() -> Void)?
+    var updateTeleprompter: ((StudioConfiguration) -> Void)?
+    @Published var choosingTranscript = false
+
+    var canPunchInCamera: Bool {
+        configuration.layout == .desktopChat && configuration.cameraEnabled && !busy
+    }
+
+    func toggleCameraPunchIn() {
+        guard canPunchInCamera else { return }
+        configuration.cameraPunchIn.toggle()
+    }
     private var saveTask: Task<Void, Never>?
     private var updateTask: Task<Void, Never>?
     private var rehearsalStartTask: Task<Void, Never>?
@@ -71,6 +92,7 @@ final class StudioModel: ObservableObject {
         self.demo = demo
         twitch = demo ? TwitchSession(persist: false) : .shared
         annotationSettings = AnnotationSettings(persist: !demo)
+        teleprompter = TeleprompterModel(session: twitch)
         onboardingCompleted = demo ? false : UserDefaults.standard.bool(forKey: Self.onboardingKey)
         if !demo, let data = try? Data(contentsOf: persistenceURL), let saved = try? JSONDecoder().decode(StudioConfiguration.self, from: data) {
             configuration = saved
@@ -86,6 +108,7 @@ final class StudioModel: ObservableObject {
         }
         if demo { configuration.recordingDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("StreamApp-Demo").path }
         refreshBackgroundImageState()
+        teleprompter.configure(configuration)
         loading = false
         // Device enumeration is non-capturing. Screen/window enumeration is explicit.
         cameras = engine.cameras(); microphones = engine.microphones()
@@ -171,7 +194,13 @@ final class StudioModel: ObservableObject {
                 self.pendingUpdate = false
                 var next = self.configuration
                 if self.rehearsalActive { next.streamingEnabled = false; next.recordingEnabled = true }
-                do { try await self.engine.update(configuration: next) }
+                do {
+                    try await self.engine.update(configuration: next)
+                    if next.teleprompterMode == self.configuration.teleprompterMode,
+                       next.teleprompterInCapture == self.configuration.teleprompterInCapture {
+                        self.updateTeleprompter?(self.configuration)
+                    }
+                }
                 catch { self.message = error.localizedDescription }
             }
             self.updateTask = nil
@@ -334,6 +363,35 @@ final class StudioModel: ObservableObject {
         let panel = NSOpenPanel(); panel.canChooseDirectories = true; panel.canChooseFiles = false
         panel.canCreateDirectories = true; panel.prompt = "Use Folder"
         if panel.runModal() == .OK, let url = panel.url { configuration.recordingDirectory = url.path }
+    }
+    func chooseTranscript() {
+        choosingTranscript = true
+        defer { choosingTranscript = false }
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText, .plainText]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.prompt = "Open Transcript"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        if configuration.transcriptPath == url.path { teleprompter.reloadTranscript() }
+        else { configuration.transcriptPath = url.path }
+    }
+
+    func reloadTranscript() { teleprompter.reloadTranscript() }
+
+    func saveTranscriptTemplate() {
+        choosingTranscript = true
+        defer { choosingTranscript = false }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
+        panel.nameFieldStringValue = "Transcript.md"
+        panel.prompt = "Save Template"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try TeleprompterModel.markdownTemplate.write(to: url, atomically: true, encoding: .utf8)
+            configuration.transcriptPath = url.path
+            teleprompter.reloadTranscript()
+        } catch { message = "Could not save transcript template: \(error.localizedDescription)" }
     }
     var backgroundImageFilename: String? {
         guard !configuration.backgroundImagePath.isEmpty else { return nil }

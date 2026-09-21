@@ -22,6 +22,13 @@ enum StreamService: String, Codable, CaseIterable, Identifiable {
     var id: String { rawValue }
     var title: String { self == .twitch ? "Twitch account" : "Custom RTMP" }
 }
+enum TeleprompterMode: String, Codable, CaseIterable, Identifiable {
+    case off, transcript, twitchChat
+    var id: String { rawValue }
+    var title: String {
+        switch self { case .off: "Off"; case .transcript: "Transcript"; case .twitchChat: "Twitch chat" }
+    }
+}
 struct DeviceOption: Identifiable, Hashable { let id: String; let name: String }
 struct CaptureSource: Identifiable, Hashable {
     enum Kind: String { case display, window }
@@ -116,6 +123,14 @@ struct StudioConfiguration: Codable, Equatable {
     var cameraID = ""
     var cameraCorner: CameraCorner = .bottomRight
     var cameraSize = 0.22
+    var cameraPunchInSize = 0.52
+    /// Session-only emphasis; intentionally excluded from Codable persistence.
+    var cameraPunchIn = false
+    var effectiveCameraSize: Double {
+        let base = min(0.4, max(0.12, cameraSize))
+        guard cameraPunchIn, layout == .desktopChat, cameraEnabled else { return base }
+        return min(0.9, max(0.4, cameraPunchInSize))
+    }
     var mirrorCamera = true
     var chatOnLeft = false
     var chatWidth = 384.0
@@ -123,6 +138,9 @@ struct StudioConfiguration: Codable, Equatable {
     // Empty follows the signed-in account; selecting chat never changes the broadcast target.
     var twitchChatChannel = ""
     var chatAppearance = ChatAppearance()
+    var teleprompterMode: TeleprompterMode = .off
+    var teleprompterInCapture = false
+    var transcriptPath = ""
     var microphoneEnabled = false
     var microphoneID = ""
     var microphoneGain = 1.0
@@ -167,8 +185,10 @@ struct StudioConfiguration: Codable, Equatable {
     init() {}
     private enum CodingKeys: String, CodingKey {
         case layout, displayID, windowID, cameraEnabled, cameraID, cameraCorner, cameraSize, mirrorCamera, chatOnLeft, chatWidth, chatEnabled, twitchChatChannel, microphoneEnabled, microphoneID, microphoneGain, microphoneMuted, microphoneCompressionEnabled, systemAudioEnabled, systemAudioGain, systemAudioMuted, recordingEnabled, recordingDirectory, streamingEnabled, streamService, streamURL, twitchTestMode, excludedApplicationIDs
+        case cameraPunchInSize
         case showStreamAppWindows
         case chatAppearance
+        case teleprompterMode, teleprompterInCapture, transcriptPath
         case systemAudioApplicationID
         case includeMenuBar
         case backgroundStyle, backgroundRed, backgroundGreen, backgroundBlue, backgroundBlurRadius, backgroundImagePath
@@ -190,12 +210,16 @@ struct StudioConfiguration: Codable, Equatable {
         cameraID = try values.decodeIfPresent(String.self, forKey: .cameraID) ?? cameraID
         cameraCorner = try values.decodeIfPresent(CameraCorner.self, forKey: .cameraCorner) ?? cameraCorner
         cameraSize = try values.decodeIfPresent(Double.self, forKey: .cameraSize) ?? cameraSize
+        cameraPunchInSize = min(0.9, max(0.4, try values.decodeIfPresent(Double.self, forKey: .cameraPunchInSize) ?? cameraPunchInSize))
         mirrorCamera = try values.decodeIfPresent(Bool.self, forKey: .mirrorCamera) ?? mirrorCamera
         chatOnLeft = try values.decodeIfPresent(Bool.self, forKey: .chatOnLeft) ?? chatOnLeft
         chatWidth = try values.decodeIfPresent(Double.self, forKey: .chatWidth) ?? chatWidth
         chatEnabled = try values.decodeIfPresent(Bool.self, forKey: .chatEnabled) ?? chatEnabled
         twitchChatChannel = try values.decodeIfPresent(String.self, forKey: .twitchChatChannel) ?? twitchChatChannel
         chatAppearance = try values.decodeIfPresent(ChatAppearance.self, forKey: .chatAppearance) ?? chatAppearance
+        teleprompterMode = try values.decodeIfPresent(TeleprompterMode.self, forKey: .teleprompterMode) ?? teleprompterMode
+        teleprompterInCapture = try values.decodeIfPresent(Bool.self, forKey: .teleprompterInCapture) ?? teleprompterInCapture
+        transcriptPath = try values.decodeIfPresent(String.self, forKey: .transcriptPath) ?? transcriptPath
         microphoneEnabled = try values.decodeIfPresent(Bool.self, forKey: .microphoneEnabled) ?? microphoneEnabled
         microphoneID = try values.decodeIfPresent(String.self, forKey: .microphoneID) ?? microphoneID
         microphoneGain = try values.decodeIfPresent(Double.self, forKey: .microphoneGain) ?? microphoneGain

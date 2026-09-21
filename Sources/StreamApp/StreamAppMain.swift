@@ -26,7 +26,10 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
     private var onboardingWindow: NSWindow?
     private var closingOnboarding = false
     private var annotations: AnnotationOverlay?
+    private var shortcuts: StudioShortcuts?
     private var sceneSubscription: AnyCancellable?
+    private var teleprompter: TeleprompterOverlay?
+    private var teleprompterSubscriptions = Set<AnyCancellable>()
     private var localPopoverMonitor: Any?
     private var globalPopoverMonitor: Any?
 
@@ -38,10 +41,56 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
             Task { await runSmoke(arguments) }
             return
         }
+        let shortcuts = StudioShortcuts()
+        self.shortcuts = shortcuts
+        shortcuts.onAnnotation = { [weak self] in
+            self?.model.toggleAnnotations?()
+        }
+        shortcuts.onCameraPunchIn = { [weak self] in self?.model.toggleCameraPunchIn() }
+        shortcuts.onTranscriptNext = { [weak self] in self?.model.teleprompter.nextPage() }
+        shortcuts.onTranscriptPrevious = { [weak self] in self?.model.teleprompter.previousPage() }
+        shortcuts.onRegistrationFailure = { [weak self] registration, _ in
+            guard let self else { return }
+            switch registration {
+            case .annotation: self.model.message = "Drawing shortcut is already in use. Use Annotate desktop from the menu."
+            case .cameraPunchIn: self.model.message = "Webcam punch-in shortcut is already in use. Use Punch in from the menu."
+            case .transcriptNext: self.model.message = "Right arrow is already in use. Use Next in Prompter settings."
+            case .transcriptPrevious: self.model.message = "Left arrow is already in use. Use Previous in Prompter settings."
+            }
+        }
+        shortcuts.start()
+        let teleprompter = TeleprompterOverlay(model: model.teleprompter)
+        self.teleprompter = teleprompter
+        model.engine.teleprompterWindowIDs = teleprompter.windowIDs
+        teleprompter.onPresentationChanged = { [weak self] in self?.refreshTranscriptShortcut() }
+        model.hideTeleprompter = { [weak teleprompter] in teleprompter?.hide() }
+        model.updateTeleprompter = { [weak self, weak teleprompter] c in
+            guard let self, let teleprompter else { return }
+            teleprompter.update(configuration: c)
+            // Newly ordered windows may only now be discoverable by ScreenCaptureKit.
+            if c.teleprompterInCapture && c.teleprompterMode != .off {
+                Task {
+                    do { try await self.model.engine.refreshCaptureFilter() }
+                    catch {
+                        teleprompter.hide()
+                        self.model.message = "Could not update teleprompter capture visibility: \(error.localizedDescription)"
+                    }
+                }
+            }
+        }
+        teleprompter.update(configuration: model.configuration)
+        Publishers.CombineLatest4(model.$configuration, model.teleprompter.$pageCount,
+                                  model.$settingsVisible, model.$choosingTranscript)
+            .sink { [weak self] configuration, pages, settings, choosing in
+                self?.setTranscriptShortcut(configuration: configuration, pages: pages,
+                                            settings: settings, choosing: choosing)
+            }.store(in: &teleprompterSubscriptions)
+        NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)
+            .sink { [weak self] _ in self?.refreshWindowCaptureVisibility() }
+            .store(in: &teleprompterSubscriptions)
         let annotations = AnnotationOverlay(settings: model.annotationSettings)
         self.annotations = annotations
         model.engine.annotationWindowID = annotations.canvasWindowID
-        annotations.targetDisplay = { [weak self] in self?.model.configuration.displayID ?? CGMainDisplayID() }
         annotations.onToggleRequested = { [weak self] _ in
             guard let self else { return false }
             guard !model.busy, model.configuration.layout == .desktopChat, model.configuration.windowID == nil else {
@@ -67,7 +116,7 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
             annotations.toggle(on: model.configuration.displayID ?? CGMainDisplayID())
         }
         model.clearAnnotations = { [weak annotations] in annotations?.clear() }
-        if annotations.registrationFailed { model.message = "Drawing shortcut is already in use. Use Annotate desktop from the menu." }
+
         sceneSubscription = model.$configuration.sink { [weak annotations] c in
             if c.layout != .desktopChat || c.windowID != nil { annotations?.stopDrawing(); annotations?.clear() }
         }
@@ -106,7 +155,29 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
         fflush(stdout)
     }
 
-    func applicationDidBecomeActive(_ notification: Notification) { model?.refreshAuthorization() }
+    func applicationDidBecomeActive(_ notification: Notification) {
+        model?.refreshAuthorization()
+        refreshTranscriptShortcut()
+    }
+
+    private func setTranscriptShortcut(configuration: StudioConfiguration, pages: Int, settings: Bool, choosing: Bool) {
+        shortcuts?.setTranscriptEnabled(configuration.teleprompterMode == .transcript && pages > 0 &&
+            teleprompter?.isExpanded == true && !choosing && !(NSApp.isActive && settings) && NSApp.modalWindow == nil)
+    }
+
+    private func refreshTranscriptShortcut() {
+        guard let model else { return }
+        setTranscriptShortcut(configuration: model.configuration, pages: model.teleprompter.pageCount,
+                              settings: model.settingsVisible, choosing: model.choosingTranscript)
+    }
+
+    private func refreshWindowCaptureVisibility() {
+        guard let model, model.configuration.showStreamAppWindows else { return }
+        Task {
+            do { try await model.engine.refreshCaptureFilter() }
+            catch { model.message = "Could not refresh window visibility: \(error.localizedDescription)" }
+        }
+    }
 
     private var controls: StudioPopover {
         StudioPopover(model: model, engine: model.engine, openSettings: { [weak self] in self?.showSettings() },
@@ -183,6 +254,7 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
 
     func applicationDidResignActive(_ notification: Notification) {
         if !pointerIsOverStatusItem { popover.performClose(nil) }
+        refreshTranscriptShortcut()
     }
 
 

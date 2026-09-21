@@ -20,6 +20,10 @@ final class StudioEngine: ObservableObject {
     @Published private(set) var outputHealth = "Idle"
     @Published private(set) var captureApplications: [DeviceOption] = []
     var annotationWindowID: CGWindowID?
+    var teleprompterWindowIDs: Set<CGWindowID> = []
+    private var captureFilterRevision: UInt64 = 0
+    private var captureFilterUpdate: Task<Void, Error>?
+    private var desiredConfiguration = StudioConfiguration()
     private var inputs: RenderInputs?
     private var bridge: CaptureBridge?
     private var audioBridge: CaptureBridge?
@@ -257,6 +261,7 @@ final class StudioEngine: ObservableObject {
         await reconcileMenuPreview()
         errorMessage = nil; status = "Starting"; outputHealth = "Preparing output…"
         self.configuration = configuration; self.synthetic = synthetic
+        desiredConfiguration = configuration
         do {
             let inputs = RenderInputs(); inputs.configure(configuration); self.inputs = inputs
             inputs.setReduceMotion(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
@@ -317,6 +322,7 @@ final class StudioEngine: ObservableObject {
 
     func update(configuration next: StudioConfiguration) async throws {
         guard !stopping else { return }
+        desiredConfiguration = next
         if !isRunning {
             if previewDesired {
                 let old = previewConfiguration
@@ -327,6 +333,7 @@ final class StudioEngine: ObservableObject {
                    old.layout == next.layout, old.cameraEnabled == next.cameraEnabled, old.cameraID == next.cameraID,
                    old.chatEnabled == next.chatEnabled, old.twitchChatChannel == next.twitchChatChannel, old.chatWidth == next.chatWidth,
                    old.showStreamAppWindows == next.showStreamAppWindows,
+                   old.teleprompterInCapture == next.teleprompterInCapture,
                    old.includeMenuBar == next.includeMenuBar,
                    old.excludedApplicationIDs == next.excludedApplicationIDs, old.excludedWindowIDs == next.excludedWindowIDs {
                     if old.dockFitRegion != next.dockFitRegion, videoPreviewMode == .program,
@@ -369,7 +376,7 @@ final class StudioEngine: ObservableObject {
                 }
                 if old.chatEnabled != next.chatEnabled || old.twitchChatChannel != next.twitchChatChannel || old.chatWidth != next.chatWidth { configureChat(next) }
                 chat?.updateAppearance(next.chatAppearance)
-                if old.showStreamAppWindows != next.showStreamAppWindows || old.includeMenuBar != next.includeMenuBar || old.excludedApplicationIDs != next.excludedApplicationIDs || old.excludedWindowIDs != next.excludedWindowIDs {
+                if old.showStreamAppWindows != next.showStreamAppWindows || old.teleprompterInCapture != next.teleprompterInCapture || old.includeMenuBar != next.includeMenuBar || old.excludedApplicationIDs != next.excludedApplicationIDs || old.excludedWindowIDs != next.excludedWindowIDs {
                     try await updateCaptureFilter(next)
                 }
             }
@@ -422,18 +429,37 @@ final class StudioEngine: ObservableObject {
         self.chat = Chat(onImage: { image in inputs.setChat(image) }, channel: c.twitchChatChannel, width: Int(c.chatWidth), appearance: c.chatAppearance)
     }
     func refreshCaptureFilter() async throws {
-        try await updateCaptureFilter(configuration)
+        try await updateCaptureFilter(desiredConfiguration)
+        if let previewStream, !previewSynthetic {
+            let revision = previewGeneration
+            let filter = try await captureFilter(previewConfiguration)
+            guard revision == previewGeneration, previewStream === self.previewStream else { return }
+            try await previewStream.updateContentFilter(filter)
+        }
     }
     private func updateCaptureFilter(_ c: StudioConfiguration) async throws {
         guard let stream, !synthetic else { return }
+        captureFilterRevision &+= 1
+        let revision = captureFilterRevision
         let session = generation
-        let filter = try await captureFilter(c)
-        guard generation == session, !stopping else { return }
-        try await stream.updateContentFilter(filter)
+        let previous = captureFilterUpdate
+        let update = Task { [weak self] in
+            _ = try? await previous?.value
+            guard let self, generation == session, !stopping, stream === self.stream else { return }
+            let filter = try await captureFilter(c)
+            guard generation == session, !stopping, stream === self.stream else { return }
+            try await stream.updateContentFilter(filter)
+        }
+        captureFilterUpdate = update
+        defer { if revision == captureFilterRevision { captureFilterUpdate = nil } }
+        try await update.value
     }
     private func captureFilter(_ c: StudioConfiguration) async throws -> SCContentFilter {
         let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false)
         if let id = c.windowID {
+            guard !teleprompterWindowIDs.contains(id) || c.teleprompterInCapture else {
+                throw EngineError.message("The teleprompter is private. Choose another capture source.")
+            }
             guard let window = content.windows.first(where: { $0.windowID == id }) else { throw EngineError.message("Selected window is no longer available") }
             guard !c.excludedWindowIDs.contains(id), !c.excludedApplicationIDs.contains(window.owningApplication?.bundleIdentifier ?? "") else {
                 throw EngineError.message("The selected capture source is excluded. Choose another source or remove its exclusion.")
@@ -444,17 +470,24 @@ final class StudioEngine: ObservableObject {
         guard let display = content.displays.first(where: { $0.displayID == id }) else { throw EngineError.message("Select an available display") }
         let excluded = Set(c.excludedApplicationIDs)
         let applications = content.applications.filter {
-            ($0.processID == ProcessInfo.processInfo.processIdentifier && !c.showStreamAppWindows) || excluded.contains($0.bundleIdentifier)
+            // Exclude our process even with “Show StreamApp windows” enabled,
+            // then allow known windows individually. New/private panels fail closed.
+            $0.processID == ProcessInfo.processInfo.processIdentifier || excluded.contains($0.bundleIdentifier)
         }
         let excludedPIDs = Set(applications.map(\.processID))
         let exceptions = content.windows.filter { window in
-            if window.windowID == annotationWindowID { return excludedPIDs.contains(window.owningApplication?.processID ?? -1) }
-            return c.excludedWindowIDs.contains(window.windowID) && !excludedPIDs.contains(window.owningApplication?.processID ?? -1)
+            let owner = window.owningApplication?.processID ?? -1
+            let visible = CaptureWindowPolicy.isVisible(
+                windowID: window.windowID, isOwnWindow: owner == ProcessInfo.processInfo.processIdentifier,
+                applicationExcluded: excluded.contains(window.owningApplication?.bundleIdentifier ?? ""), configuration: c,
+                annotationWindowID: annotationWindowID, teleprompterWindowIDs: teleprompterWindowIDs)
+            return excludedPIDs.contains(owner) == visible
         }
         let filter = SCContentFilter(display: display, excludingApplications: applications, exceptingWindows: exceptions)
         filter.includeMenuBar = c.includeMenuBar
         return filter
     }
+
     private func audioCaptureFilter(_ c: StudioConfiguration) async throws -> (filter: SCContentFilter, applications: [NSRunningApplication]) {
         let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false)
         let displayID = c.displayID ?? CGMainDisplayID()
@@ -537,6 +570,20 @@ final class StudioEngine: ObservableObject {
         try await camera.start(id: c.cameraID)
         guard session == generation, !stopping else { await camera.stop(); throw CancellationError() }
         self.camera = camera
+    }
+}
+
+/// Explicit private-window rules take precedence over the broad app visibility toggle.
+enum CaptureWindowPolicy {
+    static func isVisible(windowID: CGWindowID, isOwnWindow: Bool, applicationExcluded: Bool,
+                          configuration c: StudioConfiguration, annotationWindowID: CGWindowID?,
+                          teleprompterWindowIDs: Set<CGWindowID>) -> Bool {
+        if teleprompterWindowIDs.contains(windowID) {
+            return c.teleprompterInCapture && !c.excludedWindowIDs.contains(windowID)
+        }
+        if windowID == annotationWindowID { return true }
+        if applicationExcluded || c.excludedWindowIDs.contains(windowID) { return false }
+        return !isOwnWindow || c.showStreamAppWindows
     }
 }
 

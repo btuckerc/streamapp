@@ -18,7 +18,7 @@ struct SceneGeometry: Equatable {
         } else {
             desktop = CGRect(x: c.chatOnLeft ? width : 0, y: 0, width: 1920 - width, height: 1080)
             chat = CGRect(x: c.chatOnLeft ? 0 : desktop.width, y: 0, width: width, height: 1080)
-            let w = desktop.width * min(0.4, max(0.12, c.cameraSize))
+            let w = desktop.width * c.effectiveCameraSize
             let h = w * 9 / 16
             let left = c.cameraCorner == .bottomLeft || c.cameraCorner == .topLeft
             let top = c.cameraCorner == .topLeft || c.cameraCorner == .topRight
@@ -47,6 +47,7 @@ struct SceneTransition {
     private var from: SceneGeometry?
     private var target: SceneGeometry?
     private var startedAt: TimeInterval = 0
+    private var cameraOnly = false
 
     mutating func sample(target next: SceneGeometry, now: TimeInterval, reduceMotion: Bool) -> SceneGeometry {
         if target == nil || reduceMotion {
@@ -55,16 +56,31 @@ struct SceneTransition {
         }
         if next != target {
             // Retarget from the actually visible geometry, not the previous endpoint.
-            from = value(at: now)
+            let visible = value(at: now)
+            cameraOnly = visible.desktop == next.desktop && visible.chat == next.chat && visible.overlay == next.overlay
+            from = visible
             target = next
             startedAt = now
         }
         return value(at: now)
     }
     private func value(at now: TimeInterval) -> SceneGeometry {
-        let t = CGFloat(min(1, max(0, (now - startedAt) / Self.duration)))
+        let t = CGFloat(min(1, max(0, (now - startedAt) / (cameraOnly ? 0.6 : Self.duration))))
         if t >= 1 { return target! }
-        let eased = t * t * (3 - 2 * t)
+        let eased = cameraOnly ? Self.cameraEase(t) : t * t * (3 - 2 * t)
         return from!.interpolated(to: target!, progress: eased)
+    }
+
+    /// Cubic-bezier(0.22, 0, 0.18, 1): soft departure, a decisive move, gentle settle.
+    /// Solve the curve's time coordinate; using t directly would be a different easing.
+    private static func cameraEase(_ t: CGFloat) -> CGFloat {
+        var u = t
+        for _ in 0..<6 {
+            let error = u * (0.66 + u * (-0.78 + 1.12 * u)) - t
+            if abs(error) < 0.000001 { break }
+            let slope = 0.66 + u * (-1.56 + 3.36 * u)
+            u = min(1, max(0, u - error / slope))
+        }
+        return u * u * (3 - 2 * u)
     }
 }

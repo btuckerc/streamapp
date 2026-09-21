@@ -1,6 +1,5 @@
 import AppKit
 import Combine
-import Carbon.HIToolbox
 enum AnnotationColorTarget: Int { case stroke, fill, highlighter }
 
 
@@ -10,15 +9,11 @@ final class AnnotationOverlay: NSObject, ObservableObject {
     enum Tool { case pen, highlighter, eraser, arrow, ellipse, rectangle }
     @Published private(set) var canvasWindowID: CGWindowID = 0
     @Published private(set) var isDrawing = false
-    @Published private(set) var registrationFailed = false
     var onToggleRequested: ((CGDirectDisplayID) -> Bool)?
-    var targetDisplay: (() -> CGDirectDisplayID?)?
     var onCanvasShown: (() -> Void)?
     private let canvas = AnnotationWindow(contentRect: NSRect(x: 0, y: 0, width: 1, height: 1), styleMask: .borderless, backing: .buffered, defer: false)
     private let ink: AnnotationInk
     private let toolbar = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 411, height: 52), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-    private var hotKey: EventHotKeyRef?
-    private var handler: EventHandlerRef?
     private var screenObserver: NSObjectProtocol?
     private var displayID: CGDirectDisplayID?
     private weak var previousApplication: NSRunningApplication?
@@ -87,6 +82,10 @@ final class AnnotationOverlay: NSObject, ObservableObject {
         straightButton.toolTip = "Straight — toggle straight pen lines and arrows. Your mapped Straighten button follows Hold to straighten in Drawing settings."
         straightButton.setAccessibilityHelp(straightButton.toolTip)
         tools.insertArrangedSubview(straightButton, at: 6)
+        let colorButton = NSButton(title: "Colors", target: self, action: #selector(openColors))
+        configureIcon(colorButton, symbol: "paintpalette")
+        colorButton.toolTip = "Colors — independent stroke, highlighter, and shape fill."
+        tools.insertArrangedSubview(colorButton, at: 6)
         ink.onStraightChanged = { [weak self] enabled in
             guard let self else { return }
             self.setSelected(self.straightButton, enabled)
@@ -99,7 +98,6 @@ final class AnnotationOverlay: NSObject, ObservableObject {
         ])
         toolbar.contentView = box
         toolbar.setContentSize(NSSize(width: tools.fittingSize.width + 20, height: 52))
-        registerShortcut()
         screenObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self, self.displayID != nil else { return }
@@ -172,10 +170,39 @@ final class AnnotationOverlay: NSObject, ObservableObject {
         guard let started = toolGestureStart else { return }
         let tapped = ProcessInfo.processInfo.systemUptime - started < 0.25
         let selected = radialView?.selectedIndex
+        let point = toolGesturePoint
         cancelToolGesture()
         guard isDrawing else { return }
         if tapped { selectTool(ink.tool == .pen ? 2 : 0) }
-        else if let selected { selectTool(selected) }
+        else if let selected { chooseRadialItem(selected, at: point) }
+    }
+    private func chooseRadialItem(_ index: Int, at point: NSPoint) {
+        switch index {
+        case 0: showColorPicker(at: point)
+        case 6: dismissPicker(); undo()
+        default:
+            let toolIndices = [1: 0, 2: 3, 3: 5, 4: 4, 5: 2, 7: 1]
+            if let tool = toolIndices[index] { dismissPicker(); selectTool(tool) }
+        }
+    }
+    @objc private func openColors() {
+        cancelToolGesture()
+        showColorPicker(at: NSPoint(x: ink.bounds.midX, y: ink.bounds.midY))
+    }
+    @objc private func backToTools() {
+        guard let picker else { return }
+        let point = canvas.convertPoint(fromScreen: NSPoint(x: picker.frame.midX, y: picker.frame.midY))
+        dismissPicker()
+        let panel = AnnotationPickerPanel(contentRect: NSRect(x: 0, y: 0, width: 300, height: 300),
+                                          styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel.isOpaque = false; panel.backgroundColor = .clear
+        panel.onEscape = { [weak self] in self?.cancelPicker() }
+        let view = AnnotationRadialView(frame: NSRect(x: 0, y: 0, width: 300, height: 300))
+        view.onSelect = { [weak self] index in
+            guard let self else { return }
+            if let index { self.chooseRadialItem(index, at: point) } else { self.cancelPicker() }
+        }
+        panel.contentView = view; self.picker = panel; presentPicker(panel, at: point)
     }
     private func cancelToolGesture() {
         guard toolGestureStart != nil else { return }
@@ -207,35 +234,51 @@ final class AnnotationOverlay: NSObject, ObservableObject {
     private func showColorPicker(at point: NSPoint) {
         dismissPicker(); ink.finishStroke()
         paletteTarget = ink.tool == .highlighter ? .highlighter : .stroke
-        let panel = AnnotationPickerPanel(contentRect: NSRect(x: 0, y: 0, width: 300, height: 130), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        let panel = AnnotationPickerPanel(contentRect: NSRect(x: 0, y: 0, width: 400, height: 400), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel.isOpaque = false; panel.backgroundColor = .clear
         panel.onEscape = { [weak self] in self?.cancelPicker() }
-        let host = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 130))
-        let targets = NSSegmentedControl(labels: ["Stroke", "Fill", "Highlighter"], trackingMode: .selectOne, target: self, action: #selector(colorTargetChanged(_:)))
-        targets.frame = NSRect(x: 8, y: 96, width: 284, height: 26)
-        targets.selectedSegment = paletteTarget.rawValue
+        let host = AnnotationPaletteView(frame: NSRect(x: 0, y: 0, width: 400, height: 400))
+        let title = NSTextField(labelWithString: "Colors")
+        title.font = .systemFont(ofSize: 18, weight: .semibold)
+        title.alignment = .center; title.frame = NSRect(x: 110, y: 237, width: 180, height: 26)
+        host.addSubview(title)
+        let targets = NSSegmentedControl(labels: ["Stroke", "Highlighter", "Fill"], trackingMode: .selectOne, target: self, action: #selector(colorTargetChanged(_:)))
+        targets.frame = NSRect(x: 88, y: 199, width: 224, height: 28)
+        targets.selectedSegment = paletteTarget == .highlighter ? 1 : 0
         targets.setAccessibilityLabel("Color to change"); host.addSubview(targets)
         let none = NSButton(title: "No fill", target: self, action: #selector(removeFill))
-        none.bezelStyle = .rounded; none.frame = NSRect(x: 106, y: 4, width: 88, height: 28)
+        none.bezelStyle = .rounded; none.frame = NSRect(x: 154, y: 163, width: 92, height: 28)
         none.isHidden = paletteTarget != .fill; host.addSubview(none); noFillButton = none
-        let colors: [NSColor] = [.systemRed, .systemOrange, .systemYellow, .systemGreen, .systemBlue, .systemPurple, .white, .black]
-        for (i, color) in colors.enumerated() {
+        let back = NSButton(title: "‹ Tools", target: self, action: #selector(backToTools))
+        back.bezelStyle = .rounded; back.frame = NSRect(x: 150, y: 127, width: 100, height: 28)
+        host.addSubview(back)
+        for (i, color) in Self.paletteColors.enumerated() {
+            let angle = CGFloat.pi / 2 - CGFloat(i) * .pi / 4
             let b = NSButton(title: "●", target: self, action: #selector(colorChoice(_:)))
-            b.attributedTitle = NSAttributedString(string: "●", attributes: [.font: NSFont.systemFont(ofSize: 28), .foregroundColor: color])
-            b.bezelStyle = .rounded; b.tag = i
-            b.frame = NSRect(x: 6 + i * 36, y: 42, width: 36, height: 42)
-            let names = ["Red", "Orange", "Yellow", "Green", "Blue", "Purple", "White", "Black"]
-            b.setAccessibilityTitle(names[i]); b.toolTip = names[i]; host.addSubview(b)
+            b.attributedTitle = NSAttributedString(string: "●", attributes: [.font: NSFont.systemFont(ofSize: 36), .foregroundColor: color])
+            b.bezelStyle = .regularSquare; b.isBordered = false; b.tag = i
+            let x = 200 + cos(angle) * 150, y = 200 + sin(angle) * 150
+            b.frame = NSRect(x: x - 28, y: y - 18, width: 56, height: 48)
+            let name = Self.paletteNames[i]
+            b.setAccessibilityLabel(name); b.toolTip = name; host.addSubview(b)
+            let label = NSTextField(labelWithString: name)
+            label.font = .systemFont(ofSize: 11, weight: .medium); label.alignment = .center
+            label.frame = NSRect(x: x - 36, y: y - 34, width: 72, height: 16)
+            host.addSubview(label)
         }
         panel.contentView = host; picker = panel; presentPicker(panel, at: point)
     }
+    private static let paletteColors: [NSColor] = [.systemRed, .systemOrange, .systemYellow, .systemGreen, .systemBlue, .systemPurple, .white, .black]
+    private static let paletteNames = ["Red", "Orange", "Yellow", "Green", "Blue", "Purple", "White", "Black"]
     @objc private func colorTargetChanged(_ control: NSSegmentedControl) {
-        guard let target = AnnotationColorTarget(rawValue: control.selectedSegment) else { return }
+        let targets: [AnnotationColorTarget] = [.stroke, .highlighter, .fill]
+        guard targets.indices.contains(control.selectedSegment) else { return }
+        let target = targets[control.selectedSegment]
         paletteTarget = target; noFillButton?.isHidden = target != .fill
     }
     @objc private func removeFill() { ink.setColor(.clear, target: .fill); cancelPicker() }
     @objc private func colorChoice(_ button: NSButton) {
-        let colors: [NSColor] = [.systemRed, .systemOrange, .systemYellow, .systemGreen, .systemBlue, .systemPurple, .white, .black]
-        ink.setColor(colors[button.tag], target: paletteTarget); cancelPicker()
+        ink.setColor(Self.paletteColors[button.tag], target: paletteTarget); cancelPicker()
     }
     private func showWidthPicker(at point: NSPoint) {
         dismissPicker(); ink.finishStroke()
@@ -286,8 +329,6 @@ final class AnnotationOverlay: NSObject, ObservableObject {
         if let toolDeactivateObserver { NotificationCenter.default.removeObserver(toolDeactivateObserver) }
         if let pickerMonitor { NSEvent.removeMonitor(pickerMonitor) }
         if let screenObserver { NotificationCenter.default.removeObserver(screenObserver) }
-        if let hotKey { UnregisterEventHotKey(hotKey) }
-        if let handler { RemoveEventHandler(handler) }
     }
     func toggle(on id: CGDirectDisplayID) {
         if isDrawing { stopDrawing(); return }
@@ -351,21 +392,6 @@ final class AnnotationOverlay: NSObject, ObservableObject {
         default: stopDrawing()
         }
     }
-    private func registerShortcut() {
-        var type = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        let callback: EventHandlerUPP = { _, _, pointer in
-            guard let pointer else { return noErr }
-            MainActor.assumeIsolated {
-                let owner = Unmanaged<AnnotationOverlay>.fromOpaque(pointer).takeUnretainedValue()
-                owner.toggle(on: owner.targetDisplay?() ?? CGMainDisplayID())
-            }
-            return noErr
-        }
-        let installed = InstallEventHandler(GetApplicationEventTarget(), callback, 1, &type, Unmanaged.passUnretained(self).toOpaque(), &handler)
-        guard installed == noErr else { registrationFailed = true; return }
-        let id = EventHotKeyID(signature: 0x5354524D, id: 1)
-        registrationFailed = RegisterEventHotKey(UInt32(kVK_ANSI_D), UInt32(controlKey | optionKey | cmdKey), id, GetApplicationEventTarget(), 0, &hotKey) != noErr
-    }
 }
 
 private final class AnnotationWindow: NSWindow {
@@ -381,11 +407,27 @@ private final class AnnotationPickerPanel: NSPanel {
     }
 }
 
+private final class AnnotationPaletteView: NSView {
+    override var isOpaque: Bool { false }
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.windowBackgroundColor.withAlphaComponent(0.98).setFill()
+        NSBezierPath(ovalIn: bounds.insetBy(dx: 3, dy: 3)).fill()
+        NSColor.separatorColor.setStroke()
+        NSBezierPath(ovalIn: bounds.insetBy(dx: 88, dy: 88)).stroke()
+    }
+}
+
 /// Event-driven radial sectors; the canvas retains input until the held button is released.
 private final class AnnotationRadialView: NSView {
     private(set) var selectedIndex: Int?
-    private let labels = ["Pen", "Highlight", "Erase", "Arrow", "Ellipse", "Rectangle"]
-    private let symbols = ["pencil.tip", "highlighter", "eraser", "arrow.up.right", "circle", "rectangle"]
+    var onSelect: ((Int?) -> Void)?
+    // Clockwise from north: palette, drawing, shapes, corrections, highlight.
+    private let labels = ["Colors", "Pen", "Arrow", "Rectangle", "Ellipse", "Erase", "Undo", "Highlight"]
+    private let symbols = ["paintpalette", "pencil.tip", "arrow.up.right", "rectangle", "circle", "eraser", "arrow.uturn.backward", "highlighter"]
+    override func mouseDown(with event: NSEvent) {
+        updateHover(at: convert(event.locationInWindow, from: nil))
+        onSelect?(selectedIndex)
+    }
     override var isOpaque: Bool { false }
 
     func updateHover(at point: NSPoint) {
@@ -393,8 +435,8 @@ private final class AnnotationRadialView: NSView {
         let index: Int?
         if hypot(dx, dy) < 36 { index = nil }
         else {
-            let angle = atan2(dy, dx)
-            index = (Int(floor((angle + .pi / 6) / (.pi / 3))) + 6) % 6
+            let angle = .pi / 2 - atan2(dy, dx)
+            index = (Int(floor((angle + .pi / 8) / (.pi / 4))) + 8) % 8
         }
         guard index != selectedIndex else { return }
         selectedIndex = index; needsDisplay = true
@@ -402,10 +444,10 @@ private final class AnnotationRadialView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         let center = NSPoint(x: bounds.midX, y: bounds.midY)
         for index in labels.indices {
-            let angle = CGFloat(index) * 60
+            let angle = 90 - CGFloat(index) * 45
             let sector = NSBezierPath()
-            sector.appendArc(withCenter: center, radius: 142, startAngle: angle - 29, endAngle: angle + 29)
-            sector.appendArc(withCenter: center, radius: 38, startAngle: angle + 29, endAngle: angle - 29, clockwise: true)
+            sector.appendArc(withCenter: center, radius: 142, startAngle: angle - 21.5, endAngle: angle + 21.5)
+            sector.appendArc(withCenter: center, radius: 38, startAngle: angle + 21.5, endAngle: angle - 21.5, clockwise: true)
             sector.close()
             (selectedIndex == index ? NSColor.controlAccentColor : NSColor.windowBackgroundColor.withAlphaComponent(0.96)).setFill()
             sector.fill()
@@ -418,7 +460,7 @@ private final class AnnotationRadialView: NSView {
                 image.withSymbolConfiguration(configuration)?.draw(in: NSRect(x: location.x - 13, y: location.y, width: 26, height: 26))
             }
             let text = labels[index] as NSString
-            let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 12, weight: .medium), .foregroundColor: color]
+            let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11, weight: .medium), .foregroundColor: color]
             let size = text.size(withAttributes: attributes)
             text.draw(at: NSPoint(x: location.x - size.width / 2, y: location.y - 20), withAttributes: attributes)
         }
