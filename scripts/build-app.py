@@ -165,9 +165,14 @@ while queue:
 
 licenses = resources / 'ThirdParty'
 licenses.mkdir()
+shutil.copy2(ROOT / 'LICENSE', licenses / 'StreamApp-GPL-3.0.txt')
 (licenses / 'ffmpeg-build.txt').write_text(ffmpeg_config)
 (licenses / 'dependency-manifest.json').write_text(json.dumps(manifest, indent=2))
 (licenses / 'NOTICE.txt').write_text(
+    'StreamApp: Copyright (C) 2026 btuckerc. Licensed under GPL-3.0-or-later.\n'
+    'You may redistribute and modify StreamApp under GPL version 3 or, at your option, any later version.\n'
+    'StreamApp is distributed WITHOUT ANY WARRANTY; see StreamApp-GPL-3.0.txt.\n'
+    'Application and matching dependency sources are provided with each release at https://github.com/btuckerc/streamapp/releases.\n'
     'This build bundles FFmpeg and the dependencies listed in dependency-manifest.json.\n'
     'FFmpeg licensing depends on its exact build configuration, recorded in ffmpeg-build.txt.\n'
     'The bundled configuration enables GPL/version-3 components; this is NOT an LGPL-only distribution.\n'

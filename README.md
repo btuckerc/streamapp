@@ -112,6 +112,14 @@ Tablet Companion’s suggested tablet-button order is **Annotate, Color, Stroke 
 
 Drag **Ellipse** or **Rectangle** to create shapes. Hold **Shift** for circles/squares, or 15° angle snapping in Straight mode. **Erase** defaults to removing whole strokes, arrows, or shapes you touch. Choose **Settings → Drawing → Eraser → Partial** to rub out just the area under the tip instead. **Undo** reverses the last drawing or eraser gesture, restoring all objects removed in that gesture.
 
+## License
+
+Copyright (C) 2026 btuckerc. StreamApp is free software: you may redistribute it and/or modify it under the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version (**GPL-3.0-or-later**).
+
+StreamApp is distributed in the hope that it will be useful, but **without any warranty**, including the implied warranties of merchantability or fitness for a particular purpose. See [LICENSE](LICENSE) for the full terms.
+
+The app links a GPL-enabled FFmpeg build. Each release includes the matching application and dependency sources, Homebrew recipes, build materials, and third-party notices in its corresponding-source archive. Third-party components retain their own copyright and compatible license terms. License notices are also bundled under `Contents/Resources/ThirdParty`. No click-through installer agreement is added.
+
 ## Notes
 
 - Video: 1080p, 30 frames per second, 6 Mb/s.
