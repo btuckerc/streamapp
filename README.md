@@ -30,7 +30,7 @@ Release mode requires an installed **Developer ID Application** certificate and 
 ```sh
 python3 scripts/build-app.py --release \
   --identity "Developer ID Application: Your Name (TEAMID)" \
-  --version 1.1.1 --build-number 4 --output /absolute/path/StreamApp.app
+  --version 1.1.1 --build-number 5 --output /absolute/path/StreamApp.app
 ```
 
 The output path must not already exist. FFmpeg is bundled from Homebrew with its dependency graph and build configuration recorded in the app; the current GPL/version-3 configuration requires corresponding source and applicable license notices for any redistribution. A nonfree FFmpeg configuration is refused.
