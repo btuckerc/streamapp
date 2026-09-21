@@ -363,7 +363,11 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
             guard let index = arguments.firstIndex(of: "--smoke"), arguments.indices.contains(index + 1) else { throw SmokeError.message("--smoke needs an output directory") }
             let directory = URL(fileURLWithPath: arguments[index + 1], isDirectory: true)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            guard Bundle.main.url(forResource: "chat", withExtension: "html", subdirectory: "StreamApp_StreamApp.bundle") != nil else { throw SmokeError.message("Packaged chat resource is missing") }
+            guard let resourceRoot = Bundle.main.resourceURL,
+                  let packagedResources = Bundle(url: resourceRoot.appendingPathComponent("StreamApp_StreamApp.bundle")),
+                  packagedResources.url(forResource: "chat", withExtension: "html") != nil else {
+                throw SmokeError.message("Packaged chat resource is missing")
+            }
             var stageSeconds = 4.0
             if let i = arguments.firstIndex(of: "--smoke-stage-seconds"), arguments.indices.contains(i + 1) {
                 guard let seconds = Double(arguments[i + 1]), seconds.isFinite, (1...120).contains(seconds) else { throw SmokeError.message("Smoke stage duration must be 1–120 seconds") }

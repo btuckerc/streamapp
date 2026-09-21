@@ -113,7 +113,7 @@ info = {
     'CFBundleIdentifier': 'dev.streamapp.studio', 'CFBundleExecutable': 'StreamApp',
     'CFBundlePackageType': 'APPL',
     'CFBundleShortVersionString': a.version if a.release else '1.2.0',
-    'CFBundleVersion': a.build_number if a.release else '6',
+    'CFBundleVersion': a.build_number if a.release else '7',
     'CFBundleIconFile': 'StreamApp.icns',
     'LSMinimumSystemVersion': '26.0', 'LSUIElement': True, 'NSHighResolutionCapable': True,
     'NSCameraUsageDescription': 'StreamApp uses the camera you enable in your broadcast layout.',
