@@ -1,5 +1,5 @@
 import AppKit
-import Foundation
+import ImageIO
 import CoreImage
 import CoreMedia
 import CoreVideo
@@ -13,25 +13,117 @@ final class RenderInputs: @unchecked Sendable {
         let screen: CVPixelBuffer?
         let camera: CVPixelBuffer?
         let chat: CGImage?
+        let backgroundImage: CGImage?
         let generation: UInt64
         let reduceMotion: Bool
     }
     private let lock = NSLock()
+    private let imageQueue = DispatchQueue(label: "streamapp.background-image-loader", qos: .utility)
     private var configuration = StudioConfiguration()
     private var screen: CVPixelBuffer?
     private var camera: CVPixelBuffer?
     private var chat: CGImage?
+    private var backgroundImage: CGImage?
+    private var backgroundImagePath = ""
+    private var imageRequest: UInt64 = 0
+    private var wallpaperRequest: UInt64 = 0
+    private var wallpaperSource: WallpaperSnapshotSource?
     private var generation: UInt64 = 0
     private var failure: String?
     private var reduceMotion = false
     func setReduceMotion(_ value: Bool) { lock.lock(); if reduceMotion != value { reduceMotion = value; generation &+= 1 }; lock.unlock() }
-    func configure(_ value: StudioConfiguration) { lock.lock(); configuration = value; generation &+= 1; if !value.cameraEnabled { camera = nil }; lock.unlock() }
+    func configure(_ value: StudioConfiguration) {
+        lock.lock()
+        let wallpaperChanged = configuration.backgroundStyle != value.backgroundStyle || configuration.displayID != value.displayID || configuration.windowID != value.windowID || configuration.dockFitRegion != value.dockFitRegion
+        let imageChanged = configuration.backgroundStyle != value.backgroundStyle || configuration.backgroundImagePath != value.backgroundImagePath
+        if (value.backgroundStyle == .mirror && wallpaperChanged) || (value.backgroundStyle != .mirror && imageChanged) {
+            backgroundImage = nil
+            backgroundImagePath = ""
+        }
+        configuration = value
+        generation &+= 1
+        if imageChanged { imageRequest &+= 1 }
+        if wallpaperChanged { wallpaperRequest &+= 1 }
+        let request = imageRequest
+        let wallpaperRequest = self.wallpaperRequest
+        let needsSourceReset = wallpaperChanged
+        if !value.cameraEnabled { camera = nil }
+        lock.unlock()
+
+        // All WallpaperAgent/AppKit work is owned by the main queue. A new
+        // token makes callbacks from a previous source harmless.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            guard self.imageRequest == request, self.wallpaperRequest == wallpaperRequest else { self.lock.unlock(); return }
+            let existing = self.wallpaperSource
+            if value.backgroundStyle != .mirror {
+                self.wallpaperSource = nil
+                self.lock.unlock()
+                existing?.stop()
+                self.prepareImage(path: value.backgroundStyle == .image ? value.backgroundImagePath : "", request: request)
+                return
+            }
+            if let existing, !needsSourceReset {
+                self.lock.unlock()
+                existing.configure(value)
+                return
+            }
+            self.wallpaperSource = nil
+            self.lock.unlock()
+            existing?.stop()
+            // Initial nil is synchronous; construct outside the lock.
+            let source = WallpaperSnapshotSource(configuration: value) { [weak self] image in
+                self?.acceptWallpaper(image, request: wallpaperRequest)
+            }
+            self.lock.lock()
+            guard self.imageRequest == request, self.wallpaperRequest == wallpaperRequest else { self.lock.unlock(); source.stop(); return }
+            self.wallpaperSource = source
+            self.lock.unlock()
+        }
+    }
+    private func prepareImage(path: String, request: UInt64) {
+        lock.lock()
+        guard imageRequest == request else { lock.unlock(); return }
+        guard backgroundImagePath != path else { lock.unlock(); return }
+        backgroundImagePath = path
+        backgroundImage = nil
+        generation &+= 1
+        lock.unlock()
+        guard !path.isEmpty else { return }
+        imageQueue.async { [weak self] in
+            guard let self else { return }
+            let image = Self.loadBackgroundImage(at: path)
+            self.lock.lock()
+            defer { self.lock.unlock() }
+            guard self.backgroundImagePath == path, self.imageRequest == request else { return }
+            self.backgroundImage = image
+            self.generation &+= 1
+        }
+    }
+    private func acceptWallpaper(_ image: CGImage?, request: UInt64) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard wallpaperRequest == request, configuration.backgroundStyle == .mirror else { return }
+        backgroundImage = image
+        backgroundImagePath = ""
+        generation &+= 1
+    }
+    private static func loadBackgroundImage(at path: String) -> CGImage? {
+        guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil) else { return nil }
+        return CGImageSourceCreateThumbnailAtIndex(source, 0, [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: 2048
+        ] as CFDictionary)
+    }
     func setScreen(_ value: CVPixelBuffer?) { lock.lock(); screen = value; generation &+= 1; lock.unlock() }
     func setCamera(_ value: CVPixelBuffer?) { lock.lock(); camera = value; generation &+= 1; lock.unlock() }
     func setChat(_ value: CGImage?) { lock.lock(); chat = value; generation &+= 1; lock.unlock() }
     func fail(_ message: String) { lock.lock(); if failure == nil { failure = message }; lock.unlock() }
     var error: String? { lock.lock(); defer { lock.unlock() }; return failure }
-    func snapshot() -> Snapshot { lock.lock(); defer { lock.unlock() }; return Snapshot(configuration: configuration, screen: screen, camera: camera, chat: chat, generation: generation, reduceMotion: reduceMotion) }
+    func snapshot() -> Snapshot { lock.lock(); defer { lock.unlock() }; return Snapshot(configuration: configuration, screen: screen, camera: camera, chat: chat, backgroundImage: backgroundImage, generation: generation, reduceMotion: reduceMotion) }
 }
 
 final class FrameRenderer: @unchecked Sendable {
@@ -48,8 +140,19 @@ final class FrameRenderer: @unchecked Sendable {
     private var previewPool: CVPixelBufferPool?
     private var renderedGeneration: UInt64?
     private var transition = SceneTransition()
-    /// Cached GPU geometry for the webcam surface. Camera frames change often, but
-    /// the rounded mask and its shadow only change when the scene geometry does.
+    /// The wallpaper texture is baked once per source/geometry change.
+    private struct MirrorBackgroundKey: Equatable {
+        let imageID: ObjectIdentifier?
+        let canvas: CGRect
+        let sourceExtent: CGRect
+        let red: CGFloat
+        let green: CGFloat
+        let blue: CGFloat
+    }
+    private var mirrorBackgroundKey: MirrorBackgroundKey?
+    private var mirrorWallpaperImage: CGImage?
+    private var mirrorBackground: CIImage?
+    /// Webcam masks and shadows only change with scene geometry.
     private var cameraSurfaceRect: CGRect?
     private var cameraSurfaceRadius: CGFloat = -1
     private var cameraSurfaceMask: CIImage?
@@ -144,7 +247,23 @@ final class FrameRenderer: @unchecked Sendable {
             let marker = CIImage(color: CIColor(red: 0.1, green: 0.8, blue: 0.8)).cropped(to: CGRect(x: CGFloat((frame * 8) % 1800), y: 140, width: 90, height: 90))
             desktop = marker.composited(over: desktop)
         }
-        var image = fit(desktop, into: g.desktop, fill: false).composited(over: black)
+        var preparedBackground: CIImage?
+        if c.backgroundStyle == .mirror {
+            let key = MirrorBackgroundKey(imageID: snapshot.backgroundImage.map { ObjectIdentifier($0) }, canvas: g.desktop, sourceExtent: desktop.extent, red: CGFloat(c.backgroundRed), green: CGFloat(c.backgroundGreen), blue: CGFloat(c.backgroundBlue))
+            if key != mirrorBackgroundKey {
+                mirrorBackgroundKey = key
+                let recipe = DesktopBackgroundRenderer.mirrorBackground(source: desktop, in: g.desktop, configuration: c, image: snapshot.backgroundImage)
+                mirrorWallpaperImage = snapshot.backgroundImage
+                mirrorBackground = context.createCGImage(recipe, from: g.desktop, format: .RGBA8, colorSpace: color, deferred: false)
+                    .map { CIImage(cgImage: $0).transformed(by: CGAffineTransform(translationX: g.desktop.minX, y: g.desktop.minY)) }
+            }
+            preparedBackground = mirrorBackground
+        } else {
+            mirrorBackgroundKey = nil
+            mirrorWallpaperImage = nil
+            mirrorBackground = nil
+        }
+        var image = DesktopBackgroundRenderer.compose(source: desktop, in: g.desktop, configuration: c, image: snapshot.backgroundImage, preparedBackground: preparedBackground)
         if let camera, g.overlay >= 1 {
             image = fit(camera, into: g.camera, fill: true).composited(over: image)
         } else if let camera {

@@ -52,10 +52,13 @@ struct SceneTransitionTests {
         var c = try JSONDecoder().decode(StudioConfiguration.self, from: data)
         #expect(c.layout == .justChatting && c.cameraEnabled)
         #expect(c.microphoneGain == 0.75 && c.recordingDirectory == "/tmp/example")
+        #expect(!c.showStreamAppWindows)
+        c.showStreamAppWindows = true
         c.chatEnabled = false; c.excludedApplicationIDs = ["example.private"]
         c.excludedWindowIDs = [1234]
         let restored = try JSONDecoder().decode(StudioConfiguration.self, from: JSONEncoder().encode(c))
         #expect(!restored.chatEnabled && restored.excludedApplicationIDs == ["example.private"])
         #expect(restored.excludedWindowIDs.isEmpty)
+        #expect(restored.showStreamAppWindows)
     }
 }

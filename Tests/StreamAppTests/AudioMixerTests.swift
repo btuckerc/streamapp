@@ -4,6 +4,20 @@ import Testing
 @testable import StreamApp
 
 struct AudioMixerTests {
+    @Test func legacyVisualAudioScopeCannotExpandToAllAppsOnUpgrade() throws {
+        let legacy = Data(#"{"systemAudioEnabled":true,"microphoneEnabled":true,"systemAudioGain":0.75,"excludedApplicationIDs":["private.app"]}"#.utf8)
+        var settings = try JSONDecoder().decode(StudioConfiguration.self, from: legacy)
+        #expect(!settings.systemAudioEnabled)
+        #expect(settings.microphoneEnabled && settings.systemAudioGain == 0.75)
+        settings.systemAudioApplicationID = "com.ableton.live"
+        settings.systemAudioEnabled = true
+        let restored = try JSONDecoder().decode(StudioConfiguration.self, from: JSONEncoder().encode(settings))
+        #expect(restored.systemAudioEnabled && restored.systemAudioApplicationID == "com.ableton.live")
+        settings.systemAudioApplicationID = ""
+        let allApps = try JSONDecoder().decode(StudioConfiguration.self, from: JSONEncoder().encode(settings))
+        #expect(allApps.systemAudioEnabled && allApps.systemAudioApplicationID.isEmpty)
+    }
+
     @Test(arguments: [false, true])
     func preservesStereoAcrossPCMLayouts(interleaved: Bool) throws {
         let mixer = AudioMixer()

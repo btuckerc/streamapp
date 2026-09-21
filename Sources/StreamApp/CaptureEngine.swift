@@ -22,9 +22,12 @@ final class StudioEngine: ObservableObject {
     var annotationWindowID: CGWindowID?
     private var inputs: RenderInputs?
     private var bridge: CaptureBridge?
+    private var audioBridge: CaptureBridge?
     private var renderer: FrameRenderer?
     private var output: MediaOutput?
     private var stream: SCStream?
+    private var audioStream: SCStream?
+    private var audioApplications: [NSRunningApplication] = []
     private var camera: CameraCapture?
     private var chat: Chat?
     private var monitor: Task<Void, Never>?
@@ -38,7 +41,11 @@ final class StudioEngine: ObservableObject {
     private var generation: UInt64 = 0
     private var previewOutput: MediaOutput?
     private var previewStream: SCStream?
-    private var previewDesired = false
+    private var previewAudioStream: SCStream?
+    private var previewAudioApplications: [NSRunningApplication] = []
+    private var menuPreviewVisible = false
+    private var settingsPreviewVisible = false
+    private var previewDesired: Bool { menuPreviewVisible || settingsPreviewVisible }
     private var previewGeneration: UInt64 = 0
     private var previewTransition: Task<Void, Never>?
     private var previewConfiguration = StudioConfiguration()
@@ -46,12 +53,27 @@ final class StudioEngine: ObservableObject {
     private var previewInputs: RenderInputs?
     private var previewCamera: CameraCapture?
     private var previewBridge: CaptureBridge?
-    /// Visible-menu capture only: no encoder, recording, or streaming output.
+    private var previewAudioBridge: CaptureBridge?
+    private var previewScreenOptions: SCStreamConfiguration?
+    private var previewScreenRect = CGRect.zero
+    private var previewScreenScale: CGFloat = 1
+    private var screenOptions: SCStreamConfiguration?
+    private var screenRect = CGRect.zero
+    private var screenScale: CGFloat = 1
+    /// Visible preview capture only: no encoder, recording, or streaming output.
     func setMenuPreview(visible: Bool, configuration: StudioConfiguration, synthetic: Bool = false) async {
-        previewDesired = visible
+        menuPreviewVisible = visible
         previewConfiguration = configuration
         previewSynthetic = synthetic
-        if !visible { previewCamera?.cancelStart() }
+        if !previewDesired { previewCamera?.cancelStart() }
+        await reconcileMenuPreview()
+    }
+
+    func setSettingsPreview(visible: Bool, configuration: StudioConfiguration, synthetic: Bool = false) async {
+        settingsPreviewVisible = visible
+        previewConfiguration = configuration
+        previewSynthetic = synthetic
+        if !previewDesired { previewCamera?.cancelStart() }
         await reconcileMenuPreview()
     }
 
@@ -77,6 +99,13 @@ final class StudioEngine: ObservableObject {
             let c = previewConfiguration
             let mode = videoPreviewMode
             let needsScreen = mode == .program && c.layout == .desktopChat
+            // Missing permission is an onboarding state, not a preview failure.
+            // Do not open any devices until the configured preview can run.
+            if !previewSynthetic {
+                if c.microphoneEnabled && AVCaptureDevice.authorizationStatus(for: .audio) != .authorized { return }
+                if mode != nil && c.cameraEnabled && AVCaptureDevice.authorizationStatus(for: .video) != .authorized { return }
+                if (c.systemAudioEnabled || needsScreen) && !CGPreflightScreenCaptureAccess() { return }
+            }
             let inputs = RenderInputs()
             inputs.configure(c)
             inputs.setReduceMotion(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
@@ -87,34 +116,42 @@ final class StudioEngine: ObservableObject {
                 try await meter.startPreview(configuration: c, synthetic: previewSynthetic)
                 guard token == previewGeneration else { await stopMenuPreview(); return }
                 if !previewSynthetic && (c.systemAudioEnabled || needsScreen) {
-                    if CGPreflightScreenCaptureAccess() {
+                    guard CGPreflightScreenCaptureAccess() else {
+                        if needsScreen { videoPreviewError = "Allow Screen Recording in Settings to preview your desktop." }
+                        if c.systemAudioEnabled { meterPreviewError = "Allow Screen Recording to capture system audio." }
+                        throw EngineError.message("Screen Recording permission is required")
+                    }
+                    let bridge = CaptureBridge(inputs: inputs, output: meter)
+                    previewBridge = bridge
+                    if needsScreen {
                         let filter = try await captureFilter(c)
                         guard token == previewGeneration else { await stopMenuPreview(); return }
                         let options = SCStreamConfiguration()
-                        if needsScreen {
-                            let rect = try captureRect(filter, configuration: c)
-                            options.sourceRect = rect
-                            let scale = min(1, min(1920 / max(1, rect.width * CGFloat(filter.pointPixelScale)), 1080 / max(1, rect.height * CGFloat(filter.pointPixelScale))))
-                            options.width = max(2, Int(rect.width * CGFloat(filter.pointPixelScale) * scale))
-                            options.height = max(2, Int(rect.height * CGFloat(filter.pointPixelScale) * scale))
-                            options.minimumFrameInterval = CMTime(value: 1, timescale: 30)
-                            options.pixelFormat = kCVPixelFormatType_32BGRA
-                            options.queueDepth = 3
-                        } else {
-                            options.width = 2; options.height = 2
-                            options.minimumFrameInterval = CMTime(value: 1, timescale: 1)
-                        }
-                        options.capturesAudio = c.systemAudioEnabled
-                        options.excludesCurrentProcessAudio = true
-                        options.sampleRate = 48_000; options.channelCount = 2
-                        let bridge = CaptureBridge(inputs: inputs, output: meter)
+                        setCaptureGeometry(options, rect: filter.contentRect, scale: CGFloat(filter.pointPixelScale), configuration: c)
+                        options.minimumFrameInterval = CMTime(value: 1, timescale: 30)
+                        options.pixelFormat = kCVPixelFormatType_32BGRA
+                        options.queueDepth = 3
+                        options.capturesAudio = false
                         let stream = SCStream(filter: filter, configuration: options, delegate: bridge)
-                        previewBridge = bridge; previewStream = stream
-                        if needsScreen { try stream.addStreamOutput(bridge, type: .screen, sampleHandlerQueue: bridge.queue) }
-                        if c.systemAudioEnabled { try stream.addStreamOutput(bridge, type: .audio, sampleHandlerQueue: bridge.audioQueue) }
+                        previewScreenOptions = options
+                        previewScreenRect = filter.contentRect
+                        previewScreenScale = CGFloat(filter.pointPixelScale)
+                        previewStream = stream
+                        try stream.addStreamOutput(bridge, type: .screen, sampleHandlerQueue: bridge.queue)
                         try await stream.startCapture()
-                    } else if needsScreen {
-                        videoPreviewError = "Allow Screen Recording in Settings to preview your desktop."
+                    }
+                    if c.systemAudioEnabled {
+                        let selection = try await audioCaptureFilter(c)
+                        guard token == previewGeneration else { await stopMenuPreview(); return }
+                        previewAudioApplications = selection.applications
+                        let bridge = CaptureBridge(inputs: inputs, output: meter, audioOnly: true)
+                        previewAudioBridge = bridge
+                        let options = audioStreamConfiguration()
+                        let stream = SCStream(filter: selection.filter, configuration: options, delegate: bridge)
+                        previewAudioStream = stream
+                        try stream.addStreamOutput(bridge, type: .screen, sampleHandlerQueue: bridge.queue)
+                        try stream.addStreamOutput(bridge, type: .audio, sampleHandlerQueue: bridge.audioQueue)
+                        try await stream.startCapture()
                     }
                 }
                 guard token == previewGeneration else { await stopMenuPreview(); return }
@@ -130,7 +167,7 @@ final class StudioEngine: ObservableObject {
                     }
                     guard token == previewGeneration else { await stopMenuPreview(); return }
                     if mode == .program && c.chatEnabled && !previewSynthetic {
-                        previewChat = Chat(onImage: { image in inputs.setChat(image) }, chatURL: c.chatURL, width: Int(c.chatWidth))
+                        previewChat = Chat(onImage: { image in inputs.setChat(image) }, channel: c.twitchChatChannel, width: Int(c.chatWidth), appearance: c.chatAppearance)
                     }
                     let renderer = try FrameRenderer(inputs: inputs, preview: previewFrames, outputFD: nil, synthetic: previewSynthetic)
                     previewRenderer = renderer
@@ -143,10 +180,14 @@ final class StudioEngine: ObservableObject {
                         do { try await Task.sleep(for: .milliseconds(200)) } catch { return }
                         guard let self, let meter = self.previewOutput else { return }
                         inputs.setReduceMotion(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
+                        if self.previewAudioApplications.contains(where: \.isTerminated) {
+                            inputs.fail("Selected audio application quit. Reopen it and restart capture.")
+                        }
                         if let failure = meter.errorMessage ?? inputs.error {
                             self.meterPreviewError = failure
                             self.videoPreviewError = failure
-                            self.previewDesired = false
+                            self.menuPreviewVisible = false
+                            self.settingsPreviewVisible = false
                             await self.reconcileMenuPreview()
                             return
                         }
@@ -157,7 +198,10 @@ final class StudioEngine: ObservableObject {
                 }
             } catch {
                 await stopMenuPreview()
-                if token == previewGeneration { videoPreviewError = error.localizedDescription }
+                if token == previewGeneration {
+                    meterPreviewError = error.localizedDescription
+                    if mode != nil { videoPreviewError = error.localizedDescription }
+                }
             }
         }
         previewTransition = task
@@ -167,7 +211,10 @@ final class StudioEngine: ObservableObject {
 
     private func stopMenuPreview() async {
         previewMonitor?.cancel(); previewMonitor = nil
+        previewAudioApplications = []
         let stream = previewStream; previewStream = nil
+        let audioStream = previewAudioStream; previewAudioStream = nil
+        previewScreenOptions = nil
         let output = previewOutput; previewOutput = nil
         let camera = previewCamera; previewCamera = nil
         let renderer = previewRenderer; previewRenderer = nil
@@ -176,8 +223,10 @@ final class StudioEngine: ObservableObject {
         if let renderer { _ = try? await renderer.finish() }
         if let camera { await camera.stop() }
         if let stream { try? await stream.stopCapture() }
+        if let audioStream { try? await audioStream.stopCapture() }
         if let output { await output.stopPreview() }
         previewBridge = nil; previewInputs = nil
+        previewAudioBridge = nil
         if !isRunning {
             previewFrames.publish(nil)
             microphoneLevel = 0; systemLevel = 0; outputLevel = 0; gainReduction = 0
@@ -215,6 +264,7 @@ final class StudioEngine: ObservableObject {
             let bridge = CaptureBridge(inputs: inputs, output: output); self.bridge = bridge
             if !synthetic {
                 try await configureScreen(configuration)
+                try await configureSystemAudio(configuration)
                 try ensureCurrent(session)
                 if configuration.cameraEnabled { try await startCamera(configuration) }
                 try ensureCurrent(session)
@@ -232,6 +282,9 @@ final class StudioEngine: ObservableObject {
                     do { try await Task.sleep(for: .milliseconds(200)) } catch { return }
                     guard let self else { return }
                     self.inputs?.setReduceMotion(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
+                    if self.audioApplications.contains(where: \.isTerminated) {
+                        self.inputs?.fail("Selected audio application quit. Reopen it and restart capture.")
+                    }
                     if let failure = self.inputs?.error ?? self.output?.errorMessage ?? self.chat?.error.map({ "Chat renderer: \($0.localizedDescription)" }) {
                         self.errorMessage = failure
                         self.monitor = nil
@@ -269,16 +322,25 @@ final class StudioEngine: ObservableObject {
                 let old = previewConfiguration
                 if meterPreviewActive, old.microphoneID == next.microphoneID,
                    old.microphoneEnabled == next.microphoneEnabled, old.systemAudioEnabled == next.systemAudioEnabled,
+                   old.systemAudioApplicationID == next.systemAudioApplicationID,
                    old.displayID == next.displayID, old.windowID == next.windowID,
-                   old.dockFitDisplayID == next.dockFitDisplayID,
                    old.layout == next.layout, old.cameraEnabled == next.cameraEnabled, old.cameraID == next.cameraID,
-                   old.chatEnabled == next.chatEnabled, old.chatURL == next.chatURL, old.chatWidth == next.chatWidth,
+                   old.chatEnabled == next.chatEnabled, old.twitchChatChannel == next.twitchChatChannel, old.chatWidth == next.chatWidth,
+                   old.showStreamAppWindows == next.showStreamAppWindows,
+                   old.includeMenuBar == next.includeMenuBar,
                    old.excludedApplicationIDs == next.excludedApplicationIDs, old.excludedWindowIDs == next.excludedWindowIDs {
+                    if old.dockFitRegion != next.dockFitRegion, videoPreviewMode == .program,
+                       next.layout == .desktopChat, let stream = previewStream, let options = previewScreenOptions {
+                        setCaptureGeometry(options, rect: previewScreenRect, scale: previewScreenScale, configuration: next)
+                        try await stream.updateConfiguration(options)
+                    }
                     previewConfiguration = next
                     previewOutput?.configurePreview(next)
                     previewInputs?.configure(next)
+                    previewChat?.updateAppearance(next.chatAppearance)
                 } else {
-                    await setMenuPreview(visible: true, configuration: next, synthetic: previewSynthetic)
+                    previewConfiguration = next
+                    await reconcileMenuPreview()
                 }
             }
             return
@@ -296,11 +358,18 @@ final class StudioEngine: ObservableObject {
                     if let camera { await camera.stop(); self.camera = nil }
                     if next.cameraEnabled { try await startCamera(next) }
                 }
-                if old.layout != next.layout || old.systemAudioEnabled != next.systemAudioEnabled || old.displayID != next.displayID || old.windowID != next.windowID {
+                if old.layout != next.layout || old.displayID != next.displayID || old.windowID != next.windowID {
                     try await configureScreen(next, preserveFrame: old.displayID == next.displayID && old.windowID == next.windowID)
+                } else if old.dockFitRegion != next.dockFitRegion, let stream, let options = screenOptions {
+                    setCaptureGeometry(options, rect: screenRect, scale: screenScale, configuration: next)
+                    try await stream.updateConfiguration(options)
                 }
-                if old.chatEnabled != next.chatEnabled || old.chatURL != next.chatURL || old.chatWidth != next.chatWidth { configureChat(next) }
-                if old.excludedApplicationIDs != next.excludedApplicationIDs || old.excludedWindowIDs != next.excludedWindowIDs {
+                if old.systemAudioEnabled != next.systemAudioEnabled || old.systemAudioApplicationID != next.systemAudioApplicationID {
+                    try await configureSystemAudio(next)
+                }
+                if old.chatEnabled != next.chatEnabled || old.twitchChatChannel != next.twitchChatChannel || old.chatWidth != next.chatWidth { configureChat(next) }
+                chat?.updateAppearance(next.chatAppearance)
+                if old.showStreamAppWindows != next.showStreamAppWindows || old.includeMenuBar != next.includeMenuBar || old.excludedApplicationIDs != next.excludedApplicationIDs || old.excludedWindowIDs != next.excludedWindowIDs {
                     try await updateCaptureFilter(next)
                 }
             }
@@ -318,8 +387,10 @@ final class StudioEngine: ObservableObject {
         monitor?.cancel(); monitor = nil
         status = "Stopping"
         chat?.stop(); chat = nil
+        audioApplications = []
         if let camera { await camera.stop(); self.camera = nil }
         if let stream { try? await stream.stopCapture(); self.stream = nil }
+        if let audioStream { try? await audioStream.stopCapture(); self.audioStream = nil }
         var videoFrames: Int64?
         if let renderer {
             do { videoFrames = try await renderer.finish() } catch { if errorMessage == nil { errorMessage = "Could not finalize video: \(error.localizedDescription)" } }
@@ -331,6 +402,7 @@ final class StudioEngine: ObservableObject {
             self.output = nil
         }
         inputs = nil; bridge = nil; previewFrames.publish(nil)
+        audioBridge = nil
         microphoneLevel = 0; systemLevel = 0; outputLevel = 0; gainReduction = 0
         isRunning = false; starting = false; stopping = false
         status = errorMessage == nil ? "Idle" : "Failed"
@@ -345,9 +417,9 @@ final class StudioEngine: ObservableObject {
             chat?.stop(); chat = nil; inputs.setChat(nil)
             return
         }
-        if chat != nil, configuration.chatURL == c.chatURL, configuration.chatWidth == c.chatWidth { return }
+        if chat != nil, configuration.twitchChatChannel == c.twitchChatChannel, configuration.chatWidth == c.chatWidth { return }
         chat?.stop()
-        self.chat = Chat(onImage: { image in inputs.setChat(image) }, chatURL: c.chatURL, width: Int(c.chatWidth))
+        self.chat = Chat(onImage: { image in inputs.setChat(image) }, channel: c.twitchChatChannel, width: Int(c.chatWidth), appearance: c.chatAppearance)
     }
     func refreshCaptureFilter() async throws {
         try await updateCaptureFilter(configuration)
@@ -368,55 +440,95 @@ final class StudioEngine: ObservableObject {
             }
             return SCContentFilter(desktopIndependentWindow: window)
         }
-        let id = c.displayID ?? (c.layout == .justChatting && c.systemAudioEnabled ? CGMainDisplayID() : 0)
+        let id = c.displayID ?? 0
         guard let display = content.displays.first(where: { $0.displayID == id }) else { throw EngineError.message("Select an available display") }
         let excluded = Set(c.excludedApplicationIDs)
         let applications = content.applications.filter {
-            $0.processID == ProcessInfo.processInfo.processIdentifier || excluded.contains($0.bundleIdentifier)
+            ($0.processID == ProcessInfo.processInfo.processIdentifier && !c.showStreamAppWindows) || excluded.contains($0.bundleIdentifier)
         }
         let excludedPIDs = Set(applications.map(\.processID))
         let exceptions = content.windows.filter { window in
-            if window.windowID == annotationWindowID { return true }
+            if window.windowID == annotationWindowID { return excludedPIDs.contains(window.owningApplication?.processID ?? -1) }
             return c.excludedWindowIDs.contains(window.windowID) && !excludedPIDs.contains(window.owningApplication?.processID ?? -1)
         }
-        return SCContentFilter(display: display, excludingApplications: applications, exceptingWindows: exceptions)
+        let filter = SCContentFilter(display: display, excludingApplications: applications, exceptingWindows: exceptions)
+        filter.includeMenuBar = c.includeMenuBar
+        return filter
     }
-    private func captureRect(_ filter: SCContentFilter, configuration c: StudioConfiguration) throws -> CGRect {
-        var rect = filter.contentRect
-        guard c.windowID == nil, let id = c.dockFitDisplayID, id == c.displayID else { return rect }
-        guard let screen = NSScreen.screens.first(where: {
-            ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == id
-        }), DockCanvasFit.fits(screen) else {
-            throw EngineError.message("The Dock or display changed. Turn off Fit desktop to 16:9, then enable it again.")
+    private func audioCaptureFilter(_ c: StudioConfiguration) async throws -> (filter: SCContentFilter, applications: [NSRunningApplication]) {
+        let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false)
+        let displayID = c.displayID ?? CGMainDisplayID()
+        guard let display = content.displays.first(where: { $0.displayID == displayID }) ?? content.displays.first else {
+            throw EngineError.message("No display is available for system audio capture")
         }
-        rect.size.height = rect.width * 9 / 16
-        return rect
+        if !c.systemAudioApplicationID.isEmpty {
+            let apps = content.applications.filter { $0.bundleIdentifier == c.systemAudioApplicationID }
+            guard !apps.isEmpty else { throw EngineError.message("Selected audio application is not running: \(c.systemAudioApplicationID)") }
+            let running = apps.compactMap { NSRunningApplication(processIdentifier: $0.processID) }
+            guard running.count == apps.count, !running.contains(where: \.isTerminated) else {
+                throw EngineError.message("Selected audio application quit. Reopen it and restart capture.")
+            }
+            return (SCContentFilter(display: display, including: apps, exceptingWindows: []), running)
+        }
+        let current = content.applications.filter { $0.processID == ProcessInfo.processInfo.processIdentifier }
+        return (SCContentFilter(display: display, excludingApplications: current, exceptingWindows: []), [])
+    }
+    private func audioStreamConfiguration() -> SCStreamConfiguration {
+        let options = SCStreamConfiguration()
+        // Match SCK's screen-backed audio path, but discard its tiny video frames.
+        options.width = 2; options.height = 2
+        options.minimumFrameInterval = CMTime(value: 1, timescale: 1)
+        options.capturesAudio = true; options.excludesCurrentProcessAudio = true
+        options.sampleRate = 48_000; options.channelCount = 2
+        return options
+    }
+    private func setCaptureGeometry(_ options: SCStreamConfiguration, rect full: CGRect, scale pixelScale: CGFloat, configuration c: StudioConfiguration) {
+        let rect = c.dockFitRegion?.crop(full, selectedDisplayID: c.displayID, windowID: c.windowID) ?? full
+        let width = max(1, rect.width * pixelScale)
+        let height = max(1, rect.height * pixelScale)
+        let scale = min(1, min(1920 / width, 1080 / height))
+        options.sourceRect = c.windowID == nil ? rect : .zero
+        options.width = max(2, Int(width * scale))
+        options.height = max(2, Int(height * scale))
     }
 
     private func configureScreen(_ c: StudioConfiguration, preserveFrame: Bool = false) async throws {
         if let stream { try await stream.stopCapture(); self.stream = nil }
         let session = generation
         if !preserveFrame { inputs?.setScreen(nil) }
-        guard c.layout == .desktopChat || c.systemAudioEnabled else { return }
-        guard CGPreflightScreenCaptureAccess() else { throw EngineError.message("Grant Screen Recording access in Settings before enabling screen or system audio capture") }
+        guard c.layout == .desktopChat else { return }
+        guard CGPreflightScreenCaptureAccess() else { throw EngineError.message("Grant Screen Recording access in Settings before enabling screen capture") }
         guard let bridge else { throw EngineError.message("Capture is not initialized") }
         let filter = try await captureFilter(c)
-        let rect = try captureRect(filter, configuration: c)
-        let width = max(1, rect.width * CGFloat(filter.pointPixelScale)); let height = max(1, rect.height * CGFloat(filter.pointPixelScale))
-        let scale = min(1, min(1920 / width, 1080 / height))
         let options = SCStreamConfiguration()
-        options.sourceRect = rect
-        options.width = max(2, Int(width * scale)); options.height = max(2, Int(height * scale))
+        setCaptureGeometry(options, rect: filter.contentRect, scale: CGFloat(filter.pointPixelScale), configuration: c)
+        screenOptions = options; screenRect = filter.contentRect; screenScale = CGFloat(filter.pointPixelScale)
         options.pixelFormat = kCVPixelFormatType_32BGRA; options.minimumFrameInterval = CMTime(value: 1, timescale: 30)
-        options.queueDepth = 3; options.showsCursor = true
-        options.capturesAudio = c.systemAudioEnabled; options.excludesCurrentProcessAudio = true
-        options.sampleRate = 48_000; options.channelCount = 2
+        options.queueDepth = 3; options.showsCursor = true; options.capturesAudio = false
         let stream = SCStream(filter: filter, configuration: options, delegate: bridge)
-        if c.layout == .desktopChat { try stream.addStreamOutput(bridge, type: .screen, sampleHandlerQueue: bridge.queue) }
-        if c.systemAudioEnabled { try stream.addStreamOutput(bridge, type: .audio, sampleHandlerQueue: bridge.audioQueue) }
+        try stream.addStreamOutput(bridge, type: .screen, sampleHandlerQueue: bridge.queue)
         try await stream.startCapture()
         guard session == generation, !stopping else { try? await stream.stopCapture(); throw CancellationError() }
         self.stream = stream
+    }
+    private func configureSystemAudio(_ c: StudioConfiguration) async throws {
+        if let audioStream { try await audioStream.stopCapture(); self.audioStream = nil }
+        audioApplications = []
+        guard c.systemAudioEnabled else { return }
+        guard CGPreflightScreenCaptureAccess() else { throw EngineError.message("Grant Screen Recording access in Settings before enabling system audio") }
+        guard let inputs, let output else { throw EngineError.message("Capture is not initialized") }
+        let bridge = CaptureBridge(inputs: inputs, output: output, audioOnly: true)
+        let session = generation
+        let selection = try await audioCaptureFilter(c)
+        try ensureCurrent(session)
+        let stream = SCStream(filter: selection.filter, configuration: audioStreamConfiguration(), delegate: bridge)
+        try stream.addStreamOutput(bridge, type: .screen, sampleHandlerQueue: bridge.queue)
+        try stream.addStreamOutput(bridge, type: .audio, sampleHandlerQueue: bridge.audioQueue)
+        try await stream.startCapture()
+        guard session == generation, !stopping else { try? await stream.stopCapture(); throw CancellationError() }
+        self.audioStream = stream
+        audioBridge = bridge
+        audioApplications = selection.applications
     }
     private func startCamera(_ c: StudioConfiguration) async throws {
         guard let inputs else { throw EngineError.message("Capture is not initialized") }
@@ -433,15 +545,18 @@ private final class CaptureBridge: NSObject, SCStreamOutput, SCStreamDelegate, @
     let audioQueue = DispatchQueue(label: "streamapp.system-audio", qos: .userInitiated)
     private let inputs: RenderInputs
     private let output: MediaOutput
-    init(inputs: RenderInputs, output: MediaOutput) { self.inputs = inputs; self.output = output }
+    private let audioOnly: Bool
+    init(inputs: RenderInputs, output: MediaOutput, audioOnly: Bool = false) {
+        self.inputs = inputs; self.output = output; self.audioOnly = audioOnly
+    }
     func stream(_ stream: SCStream, didOutputSampleBuffer sample: CMSampleBuffer, of type: SCStreamOutputType) {
         if type == .audio { output.appendSystemAudio(sample); return }
-        guard type == .screen, let image = sample.imageBuffer,
+        guard !audioOnly, type == .screen, let image = sample.imageBuffer,
               let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
               (attachments.first?[.status] as? NSNumber)?.intValue == SCFrameStatus.complete.rawValue else { return }
         inputs.setScreen(image)
     }
-    func stream(_ stream: SCStream, didStopWithError error: Error) { inputs.fail("Screen capture stopped. Reselect your source and restart.") }
+    func stream(_ stream: SCStream, didStopWithError error: Error) { inputs.fail("Capture stream stopped. Check permissions and selected sources, then restart.") }
 }
 
 private final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @unchecked Sendable {

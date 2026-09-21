@@ -7,28 +7,47 @@ struct StudioOnboarding: View {
     @ObservedObject var model: StudioModel
     @ObservedObject var engine: StudioEngine
     let onFinish: () -> Void
+    var streamingOnly = false
 
     private enum Step: Int, CaseIterable { case connect, prepare, tryIt
         var title: String { switch self { case .connect: "Connect"; case .prepare: "Prepare"; case .tryIt: "Try it" } }
     }
     @State private var step: Step = .connect
-    @State private var showTwitch = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            header
+            if !streamingOnly { header }
             Divider()
             ScrollView {
                 Group {
+                    if streamingOnly {
+                        streamingSetup
+                    } else {
                     switch step {
                     case .connect: connect
                     case .prepare: prepare
                     case .tryIt: tryIt
                     }
+                    }
                 }.padding(24)
             }
             Divider()
-            footer.padding(16)
+            if streamingOnly {
+                HStack {
+                    Button("Cancel", action: onFinish)
+                    Spacer()
+                    Button("Done") {
+                        guard model.validateStreamSetup() else { return }
+                        if model.configuration.streamService == .custom && !model.demo && !model.streamKey.isEmpty {
+                            model.saveKey()
+                            guard model.streamKey.isEmpty else { return }
+                        }
+                        onFinish()
+                    }.buttonStyle(.borderedProminent)
+                }.padding(16).disabled(model.busy)
+            } else {
+                footer.padding(16)
+            }
         }
         .frame(width: 520, height: 560)
         .onAppear { model.refreshAuthorization() }
@@ -89,13 +108,18 @@ struct StudioOnboarding: View {
                 .disabled(!model.microphoneAuthorized)
             if model.configuration.microphoneEnabled { devicePicker("Microphone", devices: model.microphones) }
             Toggle(isOn: $model.configuration.systemAudioEnabled) { Label("System audio", systemImage: "speaker.wave.2") }
-                .disabled(!model.screenAuthorized)
-            DisclosureGroup("Chat overlay (optional)") {
-                TextField("Chat server URL", text: $model.configuration.chatURL).textFieldStyle(.roundedBorder)
-                Text("Use your anglbot Message SSE endpoint for Twitch chat. Saving a Twitch stream key does not connect chat; the bridge must be running.").font(.caption2).foregroundStyle(.secondary)
+                .disabled(engine.isRunning || model.busy)
+            if model.configuration.systemAudioEnabled {
+                SystemAudioSourcePicker(model: model, engine: engine)
+                if !model.screenAuthorized {
+                    Text("Allow Screen Recording in Connect to capture system audio.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
-            Divider()
-            twitchSetup.disabled(engine.isRunning || model.busy)
+            ClickableDisclosure("Twitch account & chat (optional)") {
+                TwitchConnectionView(session: model.twitch, locked: model.demo || engine.isRunning || model.busy)
+                TwitchChatSettings(model: model, engine: engine)
+            }
         }.disabled(model.busy)
     }
 
@@ -126,21 +150,35 @@ struct StudioOnboarding: View {
         })) { Text("Default device").tag(""); ForEach(devices) { Text($0.name).tag($0.id) } }.disabled(engine.isRunning || model.busy)
     }
 
-    private var twitchSetup: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Label("Twitch (optional)", systemImage: "antenna.radiowaves.left.and.right").font(.subheadline.weight(.medium))
-                Spacer()
-                Button(showTwitch ? "Hide Twitch setup" : "Configure Twitch…") { showTwitch.toggle(); if showTwitch { configurationTwitchDefault() } }.buttonStyle(.borderless)
+
+    private var streamingSetup: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            intro("Connect streaming", "Use Twitch or another RTMP/RTMPS platform.")
+            Picker("Service", selection: $model.configuration.streamService) {
+                ForEach(StreamService.allCases) { Text($0.title).tag($0) }
             }
-            Text("Use Twitch's dashboard to create or copy a stream key. StreamApp never asks for your Twitch password or starts a broadcast here.").font(.caption).foregroundStyle(.secondary)
-            if showTwitch {
-                Button("Open Twitch stream settings") { NSWorkspace.shared.open(URL(string: "https://dashboard.twitch.tv/settings/stream")!) }.buttonStyle(.borderless)
-                TextField("Secure ingest URL", text: $model.configuration.streamURL).textFieldStyle(.roundedBorder)
-                SecureField("Stream key (stored only in Keychain)", text: $model.streamKey).textFieldStyle(.roundedBorder)
-                HStack { Button("Save key securely") { model.saveKey() }.disabled(model.streamKey.isEmpty || model.demo); if model.keySaved { Label("Saved", systemImage: "checkmark").font(.caption).foregroundStyle(.secondary) } }
-                Toggle("Enable Twitch when I start a broadcast", isOn: $model.configuration.streamingEnabled)
-                Text("Broadcasting remains a separate explicit action; local rehearsal never uses this URL or key.").font(.caption2).foregroundStyle(.secondary)
+            if model.configuration.streamService == .twitch {
+                TwitchConnectionView(session: model.twitch, locked: model.demo || engine.isRunning || model.busy)
+                TwitchChatSettings(model: model, engine: engine)
+            } else {
+                streamConnectionFields
+            }
+            Toggle("Twitch bandwidth test", isOn: $model.configuration.twitchTestMode)
+            Text("Return to the menu and press Start when ready.").font(.caption).foregroundStyle(.secondary)
+            if let message = model.message {
+                Text(message).font(.caption).foregroundStyle(.orange)
+            }
+        }
+    }
+
+    private var streamConnectionFields: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            TextField("Server URL (rtmp:// or rtmps://)", text: $model.configuration.streamURL)
+                .textFieldStyle(.roundedBorder)
+            SecureField("Stream key", text: $model.streamKey).textFieldStyle(.roundedBorder)
+            HStack {
+                Button("Save key securely") { model.saveKey() }.disabled(model.streamKey.isEmpty || model.demo)
+                if model.keySaved { Label("Saved", systemImage: "checkmark").font(.caption).foregroundStyle(.secondary) }
             }
         }
     }
@@ -177,7 +215,13 @@ struct StudioOnboarding: View {
                 SceneDiagram(configuration: model.configuration, layout: model.configuration.layout)
                     .aspectRatio(16 / 9, contentMode: .fit).accessibilityLabel("Scene layout preview")
             }
-            Toggle("Render chat", isOn: $model.configuration.chatEnabled).toggleStyle(.switch)
+            HStack {
+                Toggle("Render chat", isOn: $model.configuration.chatEnabled)
+                if step == .prepare {
+                    Spacer()
+                    DockFitControl(model: model, fit: model.dockFit, compact: true)
+                }
+            }.toggleStyle(.switch)
             HStack { meter("Mic", engine.microphoneLevel); meter("System", engine.systemLevel) }
             Text(model.rehearsalActive ? "LOCAL REC · Preview is live. Nothing is sent to Twitch." : "Preview records a local rehearsal using your selected sources. Nothing is sent to Twitch.")
                 .font(.caption).foregroundStyle(.secondary)
@@ -206,5 +250,4 @@ struct StudioOnboarding: View {
         HStack(spacing: 12) { Image(systemName: icon).frame(width: 24).foregroundStyle(.tint); VStack(alignment: .leading) { Text(title).font(.subheadline.weight(.medium)); Text(detail).font(.caption).foregroundStyle(.secondary) }; Spacer(); if ready { Image(systemName: "checkmark.circle.fill").foregroundStyle(.green) } else { Button("Allow…", action: action).buttonStyle(.bordered) } }
     }
     private func meter(_ title: String, _ value: Float) -> some View { AudioLevelMeter(title: title, level: value) }
-    private func configurationTwitchDefault() { if model.configuration.streamURL.isEmpty { model.configuration.streamURL = "rtmps://ingest.global-contribute.live-video.net:443/app" } }
 }

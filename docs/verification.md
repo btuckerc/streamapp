@@ -1,6 +1,133 @@
 # Verification — 2026-09-20
 
-## Menu preview, Twitch test mode and fitted desktop
+## Terminal chat and public emotes
+
+- Native Settings verified Terminal (24 px), Compact (20 px), Large text (32 px), Monochrome (24 px) and Custom after an individual adjustment. Live read-only `xqc` chat continued receiving messages through appearance changes without resetting its count. Test chat's native Text view exposed selectable messages.
+- A browser contrast sweep checked 8192 name/background combinations across solid and translucent modes: minimum 4.50005:1. Already-readable Twitch colors remained unchanged. Body, metadata and accents met 4.5:1. This qualifies rendered colors, not full WCAG conformance of video output.
+- The signed native probe fetched 413 global and 1030 channel codes for `xqc`, with no unavailable providers; a cached repeat took about 0.27 ms. Actual WebKit loaded `SAJ`, `Kappa`, `SourPls`, `WideHard`, a `Flower0` overlay and FFZ `CatBag` with a static flip modifier. An official Twitch fragment remained a single image; lowercase, punctuation-wrapped and substring variants stayed literal.
+- ImageIO decoded exactly one frame for six real CDN assets: `SAJ`, `GAMBA`, `SourPls`, `WideHard`, `Kappa` and `CatBag`. The BTTV `.webp` route was found to return a 492-frame animation for `SourPls`; the shipped `.png` variant decoded as one frame.
+- Browser execution checked emotes off, plain-text fallback, case/token boundaries, zero-width stack boundaries, moderation deletion/clear and style changes without resurrecting deleted messages. A 5120-message emote-rich insertion burst took about 85 ms, retained 100 messages and 200 image nodes, and reported zero animations. This is a local DOM/layout microbenchmark, not a sustained CPU or long-duration streaming qualification.
+- Native screenshot evidence is local at `.build/emote-webkit-smoke.png`; catalog and image reports are beside it. The temporary signed-app probe was removed after qualification. No message was posted and no recording or broadcast was started.
+- After removing the probe, all eight targeted Twitch session/test-mode tests passed and production packaging/persistent signing succeeded with 17 bundled libraries. The final normal app's Test chat loaded the same 413 global / 1030 channel catalog and visibly rendered real incoming `xqc` emotes; reception advanced from 22 to 149 messages. Terminal 24 px and Emotes on were verified through native accessibility. The temporary `xqc` selection was restored to the original blank/default channel, Render chat remained off, and only the owned check instance was stopped. The updated bundle is repository-root `StreamApp.app`; the installed app and pre-existing process were not replaced.
+
+## Simplified Twitch settings
+
+- Native Settings visually confirmed a single baseline-aligned checkmark, account name and info tooltip row, with Disconnect at the right. Removed the redundant chat, capture-preview and app-window instructions.
+- Apply was absent for the saved channel, appeared after editing, and disappeared after a real Twitch channel link was validated and normalized to `shroud`. Invalid typed input showed a short inline error; restoring the saved value cleared it.
+- All four Twitch session/input tests passed, including channel-link normalization and rejection of deceptive hosts, video URLs and invalid usernames. Signed production packaging passed. The updated local app was opened for inspection; the installed app was not replaced.
+- Exclude from display capture now has its own **Refresh apps and windows** button. In the native Settings check, clicking it populated the app exclusion list through the existing refresh action. No exclusion rules or capture settings were changed; signed packaging passed.
+- Both collapsible headings now use a full-width button. Native pointer checks expanded Individual windows by clicking its text and collapsed it by clicking the empty heading space; onboarding's Twitch heading also expanded and exposed its controls. Accessibility reports Expanded/Collapsed. Signed packaging passed; no capture or preference changes were made.
+- Streaming setup: the signed app's existing Custom RTMP selection showed the missing-key validation error. Selecting Twitch removed the error and manual fields immediately, with checkmark, `Connected as @itux`, and info icon aligned on one row. Twitch was left selected. Four targeted output tests passed, including missing-service migration and clearing validation errors in both switch directions. No output was started.
+
+## Direct Twitch integration
+
+- User approved the registered public application **StreamApp by btuckerc** for **itux**, with chat-read and stream-key-read scopes only.
+- The signed native app connected as `@itux`. Settings → Sources → Chat accepted `shroud`; the read-only test subscribed through production EventSub and visibly rendered two real messages with `LISTENING · #shroud · 2 RECEIVED`. No message was posted, recording started, or broadcast initiated.
+- A temporary signed-app qualification restored the account from Keychain, validated it, and successfully retrieved the account's stream key. It printed only a success boolean, never the key. The qualification entry point was removed afterward.
+- Regression coverage exercises wrong-client rejection, cancellation without later account resurrection, and concurrent unauthorized requests using one refresh rotation. No live-provider reconnect, revocation, or long-duration qualification is claimed.
+- Final source passed all 31 tests in nine suites after removing obsolete SSE tests. Production packaging and persistent signing passed; the local bundle is `StreamApp.app` (not notarized).
+- A throwaway browser execution of the shipped renderer confirmed HTML-like chat text stays inert, individual deletion, user clearing, the 100-message limit, and full clearing. This exercises DOM behavior, not live Twitch moderation delivery.
+
+## Active wallpaper capture and native control rendering
+
+- A real ScreenCaptureKit probe found the display-sized WallpaperAgent window and captured the current blue mountain wallpaper without app windows, desktop icons or menu text. The production snapshot source produced `.build/actual-wallpaper-source.png` at 2048×1330. This supersedes the earlier file-URL qualification below.
+- Temporary production-service checks verified one refresh after a simulated Space-change notification, no recapture after unrelated configuration edits, retained image identity through a RenderInputs camera-size edit, and clearing the snapshot when leaving Mirror. All 31 tests in ten suites passed with those two temporary checks present; the machine-dependent checks were removed afterward.
+- Native Layout preview showed the mountain wallpaper around the synthetic foreground. After switching from the active preview to Outputs, Record / Stream / Both labels remained upright; a long RTMPS URL and the Twitch-test switch rendered without the reported magenta rectangle or displaced knob. No broadcast, recording, permission grant or custom-image import was performed. This verifies the exercised UI scenarios, not a proven root cause for the original corruption.
+- After removing the temporary checks, the final source passed all 29 permanent tests in nine suites. Release packaging, persistent signing and installation into `~/Applications/StreamApp.app` succeeded; the installed app was relaunched.
+
+## Wallpaper reflection and Settings resets
+
+- The earlier `NSWorkspace.desktopImageURL(for:)` loader decoded a 2048×1080 image, and `.build/wallpaper-qualification.png` showed its reflection around a green foreground. The user's report and subsequent live capture established that this was the default beach asset, **not the active wallpaper**. That lookup and its claimed active-wallpaper qualification are superseded above. Permanent pixel tests still cover different wallpaper/capture colors and safe fallback when wallpaper is absent.
+- Native Settings smoke showed Mirrored wallpaper in the live preview and the shadow beneath the pinned preview. Include menu bar reset immediately restored its default without a dialog. Restore All Defaults opened confirmation; Cancel retained the wallpaper choice, while confirming reset restored Black and immediately updated the live preview.
+- Full suite passed 30 tests in ten suites, including the temporary wallpaper qualification (removed afterward). The CLT toolchain required explicit Testing framework and runtime search paths; the newly selected Xcode was awaiting license acceptance. No legal terms were accepted by automation.
+- Final source passed 29 tests in nine suites after removing the temporary qualification. Release packaging, persistent signing, and installation into `~/Applications/StreamApp.app` succeeded. With user approval, only the obsolete duplicate `otherMouseUp(with:)` override was removed from a concurrent annotation edit; its configurable pen dispatch and tests were retained.
+
+## Desktop backgrounds and Layout preview
+
+- `swift test` passed 26 tests in eight suites; the subsequently added preview-ownership regression also passed its targeted run. Release packaging, signing and installation into `~/Applications/StreamApp.app` passed.
+- Real FrameRenderer qualification produced portrait and ultra-wide examples for all five fill modes under `.build/background-qualification/`. Pixel regressions preserve the sharp foreground and catch reflected-tile scaling across wide bars.
+- Native Settings smoke verified the shared Off / Layout / Webcam control and a rendered synthetic Layout preview. Changing Black to Blurred desktop replaced the letterbox bars live. Fit 16:9 and its Dock restoration hover help were confirmed through accessibility. The redundant background hint is absent.
+- Image import UI testing was deliberately left to the user. No actual camera or new macOS permission approval was exercised by this synthetic check.
+
+## Simplified footer and streaming setup
+
+- Native screenshots verified a label-free Record / Stream / Both selector and one Start button, without the redundant local-only caption. Active output retains health/progress and Stop; bandwidth-test mode retains its non-live indicator.
+- Missing Stream and Both configuration opened Connect streaming. Done with missing details stayed in setup. Entering a loopback RTMP URL and dummy key completed setup without starting output; subsequent Start showed the existing broadcast confirmation for 127.0.0.1, which was cancelled.
+- The final installed build reopened setup when Start was pressed after cancelling incomplete setup. Returning to Record cleared the stale streaming-validation message. Configured Both did not reopen setup; Record started and stopped a synthetic local recording.
+- `swift test` passed all 20 tests. Final release packaging/signing and installation passed. UI fixtures used demo mode, with no normal preference or Keychain writes and no public broadcast.
+
+## Prepare controls, audio defaults, and menu-bar inclusion
+
+- Native onboarding smoke showed Fit 16:9 alongside Render chat in Prepare; invoking Fit opened the existing confirmation, and Cancel left the Dock unchanged.
+- Fresh demo configuration showed System audio enabled and Audio from set to all other apps. Turning audio off removed the source picker. Prepare and Settings share the same app selector, including unavailable-target handling and explicit refresh. Existing saved off/isolated choices and the legacy privacy migration remain intact.
+- A native ScreenCaptureKit screenshot probe on the main display exercised `SCContentFilter.includeMenuBar` both ways. With it off, menu text/status icons disappeared; with it on, they were visible. Both images and filter content rectangles retained 1512×982 dimensions. Evidence: `.build/menu-bar-true.png` and `.build/menu-bar-false.png`. No system menu-bar preference or permission was changed.
+- Final Settings smoke visually confirmed Include menu bar directly beneath the Dock-fit control in Layout, enabled by default. `swift test` passed 20 tests in seven suites; release packaging and signing passed. The temporary screenshot probe was removed after verification.
+
+## Unified permission recovery
+
+- `swift test`: 20 tests in seven suites passed. Final release packaging and persistent signing passed.
+- Native menu inspection with a temporary missing-permission fixture showed one **Finish permissions setup…** button above the meters, with screen/system-audio, camera and microphone listed beneath it. Clicking it opened the existing onboarding Connect step. Separate menu permission buttons were absent.
+- The host already had capture permissions; this verified missing-state presentation and navigation, not a real macOS denial/grant transition. No permissions were reset or granted. The temporary fixture was removed before the final build.
+- Final packaged `--ui-smoke` launched successfully; accessibility inspection confirmed no permission banner or legacy Grant Camera/Microphone buttons in the normal synthetic demo. Demo does not require capture permissions or save normal preferences. Test instances were stopped; the installed app was not replaced for this change.
+
+## Explicit recording / streaming modes and camera permissions
+
+- `swift test`: 17 tests in six suites passed. Release packaging/signature verification passed.
+- Actual native menu showed Record / Stream / Both and matching Start labels. Mode selection disappeared during capture; local-only, stream-only and combined summaries remained visible. Sources settings had no camera-permission button with camera access already available; onboarding's existing ready state remains a noninteractive checkmark.
+- Exercised the real UI with synthetic media and an explicit loopback RTMP destination, not a public provider. Stream-only reached the local receiver and created no local recording. Both produced a received stream and local recording. Returning to Record retained the working stream setup and recorded locally without confirmation or any network socket in its FFmpeg child (`lsof -nP -a -p PID -i` returned no sockets).
+- The retained Twitch-test setting was also exercised with Record selected: local recording started and displayed local-only status, not a misleading bandwidth-test status.
+- Three local recordings and two loopback receiver recordings fully decoded with FFmpeg. Receiver evidence remains in `.build/output-mode-receiver/`; synthetic local recordings are in the existing temporary `StreamApp-Demo` directory. Demo mode did not save normal preferences or credentials. Both test processes were stopped.
+
+## Dock auto-hide restoration
+
+- Fit now journals the original auto-hide setting before showing the Dock, restores it on disable or failed enable, and preserves a newer manually hidden state. Visibility recovery is attempted even if size recovery fails; an incomplete recovery retains the journal.
+- `swift test` passed all 17 tests in six suites. System Events auto-hide get/show/restore scripts compiled against the installed scripting dictionary without execution or permission grants.
+- Release packaging and signature verification passed. Subsequently rebuilt, installed at `~/Applications/StreamApp.app`, and relaunched after the user reported the older unhide-first message. Native UI shows the new confirmation explaining temporary visibility and saved auto-hide restoration; Cancel was exercised without granting Automation or changing Dock settings.
+- Hidden → Fit on → Fit off and failed-enable rollback are left for the user's physical check; no claim of live Dock visibility testing.
+
+### Dock settling and normalized-size readback
+
+- Fit now waits for stable visible geometry after unhiding and records the size macOS actually accepts after each intentional write; clamped/quantized readback no longer triggers the false external-change warning. Original recovery values remain unchanged.
+- Native on/off smoke enabled Fit without the reported warning and exposed a normalized-float restoration rounding issue. Restoration now uses the existing bounded size search only when direct restoration misses the exact saved tile size; pending writes tolerate one tile's normalized quantization.
+- Rebuilt and installed the signed app. The two Dock geometry tests passed. Native recovery then successfully switched Fit off without the restoration error. Hidden-Dock end-to-end verification remains unclaimed: another StreamApp UI-check instance appeared during that check, so further UI interaction was stopped and pre-check visible Dock state restored.
+
+## Ableton audio isolation and routing research
+
+- Reviewed installed Ableton Live 12.4.3 / OBS 31.0.1 version metadata and only the relevant saved audio/scene settings. Researched Apple Bluetooth/mic-mode/SCK behavior, Ableton latency/aggregate/routing guidance, OBS's native audio source implementation and BlackHole/Loopback alternatives. Detailed sources, risk matrix, recommended settings and unimplemented advanced requirements are in the architecture document.
+- Native signed-app probe exercised real ScreenCaptureKit audio with two independently launched fixture apps: 440 Hz selected app and 880 Hz unrelated app, no microphone/camera/chat/network broadcast. Full Camera → fixture-window Desktop → Full Camera retained music; absent target rejected startup; isolated menu preview produced signal; quitting the selected app stopped/finalized capture.
+- Decoded isolated recording: 440 Hz amplitude ≈0.1131; 880 Hz ≈0.00000012 at second 1, ≈0.0000668 at second 4, ≈0.00000036 at second 7. All-app mode contained both tones at ≈0.1131. Minimum 100 ms audio RMS through the middle of the scene-transition recording was 0.079898 (excluding startup/end 0.5 s). This measures app exclusion and continuity rather than trusting moving meters.
+- The native probe reproduced an existing single-window startup failure: assigning a window's global content rectangle to `sourceRect` returned “invalid parameter.” Leaving `sourceRect` zero for full-window capture fixed the same scenario. Display/Dock cropping remains on the display path.
+- Initial CLI-child tone fixtures shared process-responsibility attribution: selecting one captured both; self-excluded all-app capture excluded both. Re-running with independently LaunchServices-launched bundles established the actual isolation result above. This reinforces that app attribution is not a sandbox between arbitrary child/helper processes.
+- Isolated native recording fully decoded: 276 video packets, 433 audio packets, no backwards DTS or duplicate PTS, maximum video/audio timestamp gaps 34/22 ms. Evidence remains local under `.build/audio-qualification-4/` (`media.json`, `spectral-results.json`, recordings). The temporary probe and fixture programs were removed from shipped sources.
+- Native Computer Use verified the new Audio tab, explanatory text, refreshed app picker, and selecting the controlled AudioTone app. Demo settings were used; no normal saved audio settings, OBS scenes, Live preferences, permissions, credentials, or hardware routes were changed.
+- `swift test`: 17 tests in 6 suites passed, including a privacy regression that legacy visual-scoped audio cannot silently migrate to all-app capture; explicit chosen app/all-app scopes round-trip.
+- Final packaged synthetic smoke passed scene/chat/camera/audio controls and clean stop/restart. Both finalized recordings fully decoded with no backwards DTS or duplicate PTS: 487 video / 761 audio packets, then 91 video / 143 audio packets. Evidence: `.build/audio-final-smoke/media-0.json` and `media-1.json`.
+- Final release packaging and signature verification passed with 17 bundled libraries. Installation safely refused because the installed app and a separate annotation UI check were running; neither was interrupted. Updated bundle remains at repository-root `StreamApp.app`. Quit other instances before `python3 scripts/build-app.py --install`.
+- Not qualified: actual AirPods/Bluetooth behavior, hardware input-channel mapping, actual Live set/main/cue/plugin routing, physical camera lip-sync, real OBS capture, device hotplug/sleep, multi-hour endurance, or authenticated provider delivery. No “every setup is fixed” claim.
+
+## Annotation smoothing, styles and shapes
+
+- Integrated `swift build` passed using an isolated scratch directory so the concurrent agent's normal build directory was untouched.
+- Native AppKit smoke exercised the actual annotation source with synthetic pointer events and bitmap comparisons: visible dots, smoothing changing a jittered stroke, settings not restyling completed ink, undo restoring exact prior pixels, erasing/undoing the eraser, clear, reverse-drag Shift squares/circles, and completed shape geometry remaining unchanged after Shift release.
+- Before the pen-button swap, Computer Use visually verified raw/balanced/strong stroke examples, circle/rectangle outlines, freehand curved arrows with terminal heads, and a foreground right-click enabling the visible Straight toggle. A curved input gesture then produced a straight arrow.
+- The integrated app's `--settings-smoke` Drawing tab displayed smoothing, width, color and shape/pen-button instructions. Dragging smoothing changed Balanced to Strong; the native width increment changed 4 pt to 5 pt. The native color panel opened.
+- Rebuilt and launched the integrated `--ui-smoke` after the icon-toolbar update. All ten native SF Symbols rendered, accessible names remained intact, and selecting Arrow plus Straight produced independent visible selection outlines. Toolbar width was 411 pt, down from the text toolbar's 699 pt.
+- A throwaway settings executable verified smoothing/width/sRGB round trips and that non-persisting demo settings do not overwrite saved values. `swift test --filter AnnotationSettingsTests` passed the normalization regression: changing a published style cannot recurse indefinitely, invalid numeric values normalize, and color remains opaque.
+- Subsequent minimal-toolbar update removed the footer and reduced the installed toolbar to 411 × 52 pt. Each icon has descriptive native hover help and an accessibility label/help string. The signed release built, verified, installed into `~/Applications/StreamApp.app`, and relaunched after checking the prior app was idle. Computer Use verified the installed single-row toolbar and Arrow's accessible help. The saved smoothing key was absent, so the existing 0.5 default applies; no user style preference was overwritten.
+- Straight/freehand consistency and hold mode: four focused annotation tests passed, including bitmap thickness equality for Pen/Arrow at synthetic tablet pressure, stronger-pressure width growth, zero-pressure pen-up retention, hold before contact, converting an active curved stroke, release not latching the next stroke, exact undo after conversion, and Escape clearing a held mode. The installed Drawing settings toggle was exercised on/off; its enabled value persisted as `StreamApp.annotation.holdToStraighten = 1`, then was restored off to retain the prior interaction preference. Signed release packaging/install and native settings inspection passed.
+- Removed explanatory paragraphs from Drawing settings at user request. Rebuilt/reinstalled the signed app and visually checked the installed executable's settings UI: only smoothing, width, color, and Hold to straighten remain. The isolated verification process was stopped afterward.
+- No Wacom driver configuration was changed. Physical pressure/barrel-button delivery, subjective handwriting feel, and capture of the new geometry in a recording remain unqualified.
+- Pen-button swap: seven focused `AnnotationInkTests` passed, including physical lower/upper tablet-button masks, repeated-packet edge handling, clear during a stroke without ink resurrection, existing pressure rendering, and hold/release behavior. These are synthetic AppKit events, not physical pen-delivery verification. The temporary StreamApp Wacom profile created during investigation was removed; the saved preferences contain no StreamApp profile and retain the global lower-button function 91.
+- The signed updated bundle was launched with `--ui-smoke`. Computer Use verified middle-click selecting Straight, a curved synthetic pointer drag rendering a straight line, and right-click removing that line. The isolated smoke process was stopped. Installation of StreamApp was deliberately refused by its packaging script while existing instances were running; the verified bundle remains at the repository root.
+
+## Chat-aware live Dock sizing
+
+- Two focused geometry checks cover chat reducing the requested Dock height, a physically impossible target saturating at zero, dynamic capture height preserving desktop width/menu-bar origin, and no cropping of other displays or individual windows.
+- All 15 tests in five suites passed with the Dock changes. System Events get/set scripts compiled against this machine's scripting dictionary; neither was executed. No Automation permission was granted.
+- Physical live resizing, Handoff appearance/disappearance and the new permission flow are left for user testing. Earlier restart-based calibration evidence below does not qualify the replacement live-control implementation.
+- Release installation was blocked by concurrent capture/audio edits after that passing checkpoint. The final attempted build reported incomplete scopes around the preview monitor/catch and missing preview teardown boundaries in `CaptureEngine.swift`. The Dock revision was not installed; the previous installed app was relaunched. A combined build is required after those edits settle.
+
+## Earlier menu preview, Twitch test mode and fitted desktop
 
 - Installed native menu opens and closes on consecutive status-item clicks. Real Layout and Webcam previews were inspected; Off is first and selected after relaunch. Layout → Off removes the video surface while keeping audio meters.
 - Dock calibration initially rejected the built-in display: macOS reserved 128 points versus the 131.5-point target. The implementation now accepts a narrow desktop gap while preserving an exact 16:9 capture; it never extends into the Dock.
@@ -112,3 +239,12 @@ python3 scripts/verify-media.py PATH_TO_RECORDING --output .build/verification.j
 ```
 
 `--demo` uses synthetic sources without normal settings/Keychain writes. The packaged smoke's RTMP option accepts only loopback destinations. Historical fixture tools and original clips are preserved in the verified research archive, not shipped in the application.
+
+## Configurable annotation controls
+
+- Native UI exercised the six-tool radial picker, selected Arrow and observed toolbar selection, and opened the color/width pickers. Width choices fit a 6×4 grid. Color rendering and keyboard picker positioning were corrected after visual inspection.
+- 29 Swift tests in 9 suites passed, including delivered-button routing independent of tablet masks, no Clear from secondary-click, hover-before-contact Straighten, release semantics, and exact shortcut modifiers.
+- Production Wacom Swift smoke passed journal applied/not-applied/conflict paths, legacy restore expansion, repeated remapping baseline retention, and typed XML controls.
+- Installed Companion applied and verified Annotate/Color/Stroke width/Clear and lower Middle / upper Secondary click on the connected Intuos BT S. Overlay remained Off. Physical pen hover behavior after remapping still needs a hardware press; synthetic input is not proof of it.
+- Final installed UI showed distinct named color swatches near the pointer; a native-input stroke appeared red and disappeared with the Clear shortcut. Companion's main screen and Apply dialog were visually checked after moving setup/details into collapsed sections.
+- Driver readback retained only global application association `0`, tip function `1`, lower function `2`, upper function `3`, Press-and-Tap `false`, and button overlay `false`.

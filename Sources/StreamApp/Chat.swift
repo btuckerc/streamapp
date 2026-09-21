@@ -9,7 +9,16 @@ final class Chat: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
     let webView: WKWebView
     var error: Error?
     private(set) var snapshots = 0
+    private(set) var connectionStatus = "CONNECTING"
     private let onImage: (CGImage) -> Void
+    private let onStatus: (String) -> Void
+    private let onTranscript: ((String) -> Void)?
+    private let onEmoteStatus: ((String) -> Void)?
+    private var emoteChannelID: String?
+    private var emoteTask: Task<Void, Never>?
+    private var pendingCatalog: ChatEmoteCatalog.Catalog?
+    private var appearance: ChatAppearance
+    private var appearanceDirty = true
     private var timer: Timer?
     private var ready = false
     private var dirty = true
@@ -17,8 +26,10 @@ final class Chat: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
     private var generation: UInt64 = 1
     private var imageScale: Double?
     private var stopped = false
-    private var feedTask: Task<Void, Never>?
-    private let feedURL: URL?
+    private var feed: TwitchChatFeed?
+    private var pendingEvents: [[String: Any]] = []
+    private var pendingStatus: String?
+    private var renderTask: Task<Void, Never>?
     private var lastSnapshotAt: Date?
     private let snapshotInterval: TimeInterval = 1.0 / 30.0
 
@@ -33,10 +44,13 @@ final class Chat: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
 
     private var messageProxy: WeakMessageProxy!
 
-    init(onImage: @escaping (CGImage) -> Void, chatURL: String, width: Int = 384) {
+    init(onImage: @escaping (CGImage) -> Void, channel: String, width: Int = 384, appearance: ChatAppearance, onStatus: @escaping (String) -> Void = { _ in }, onTranscript: ((String) -> Void)? = nil, onEmoteStatus: ((String) -> Void)? = nil) {
         self.onImage = onImage
+        self.onStatus = onStatus
+        self.onTranscript = onTranscript
+        self.onEmoteStatus = onEmoteStatus
+        self.appearance = appearance
         self.width = CGFloat(width)
-        self.feedURL = URL(string: chatURL)
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .nonPersistent()
         self.webView = WKWebView(frame: NSRect(x: 0, y: 0, width: width, height: Int(Self.height)), configuration: configuration)
@@ -44,8 +58,7 @@ final class Chat: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
         messageProxy = WeakMessageProxy(self)
         webView.navigationDelegate = self
         webView.underPageBackgroundColor = .clear
-        // macOS WebKit's snapshot backing otherwise stays opaque even with clear
-        // CSS and underPageBackgroundColor. Keep text alpha for the GPU glass panel.
+        // Keep alpha when the user chooses the translucent terminal background.
         webView.setValue(false, forKey: "drawsBackground")
         configuration.userContentController.add(messageProxy, name: "chatDirty")
         configuration.userContentController.addUserScript(WKUserScript(source: Self.dirtyScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
@@ -54,14 +67,86 @@ final class Chat: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
         } else {
             error = SnapshotFailure.missingResource
         }
+        feed = TwitchChatFeed(session: .shared, channel: channel, onEvent: { [weak self] event in
+            guard let self, !self.stopped else { return }
+            var value: [String: Any]
+            switch event {
+            case .channel(let channel, let id):
+                value = ["type": "channel", "value": channel]
+                if self.emoteChannelID != id {
+                    self.emoteChannelID = id
+                    self.pendingCatalog = ChatEmoteCatalog.Catalog()
+                    self.loadEmotes()
+                }
+            case .message(let message):
+                value = ["type": "message", "id": message.id, "userID": message.userID, "login": message.login,
+                         "displayName": message.displayName, "text": message.text]
+                if let color = message.color { value["color"] = color }
+                if let source = message.sourceChannel { value["sourceChannel"] = source }
+                if let timestamp = message.timestamp { value["timestamp"] = timestamp }
+                value["fragments"] = message.fragments.map { fragment -> [String: Any] in
+                    var part: [String: Any] = ["text": fragment.text, "mention": fragment.mention]
+                    if let id = fragment.emoteID { part["emoteID"] = id }
+                    return part
+                }
+            case .deleteMessage(let id): value = ["type": "delete", "value": id]
+            case .clearUser(let id): value = ["type": "clearUser", "value": id]
+            case .clear: value = ["type": "clear"]
+            }
+            // Bound native buffering as well as the DOM. A backlog drops history, never moderation.
+            if self.pendingEvents.count >= 256 {
+                self.pendingEvents.removeAll(keepingCapacity: true)
+                self.pendingEvents.append(["type": "clear"])
+            }
+            self.pendingEvents.append(value)
+            self.scheduleRender()
+        }, onStatus: { [weak self] status in
+            guard let self, !self.stopped else { return }
+            self.connectionStatus = status
+            self.onStatus(status)
+            self.pendingStatus = status
+            self.scheduleRender()
+        })
+    }
+
+    func updateAppearance(_ value: ChatAppearance) {
+        guard appearance != value else { return }
+        let emotesChanged = appearance.emotes != value.emotes
+        appearance = value
+        appearanceDirty = true
+        if emotesChanged { loadEmotes() }
+        scheduleRender()
+    }
+
+    private func loadEmotes() {
+        emoteTask?.cancel(); emoteTask = nil
+        guard !stopped, appearance.emotes, let id = emoteChannelID else {
+            onEmoteStatus?(appearance.emotes ? "Waiting for the chat channel." : "Emotes are off.")
+            return
+        }
+        onEmoteStatus?("Loading Twitch, 7TV, BTTV and FFZ emotes…")
+        emoteTask = Task { [weak self] in
+            while !Task.isCancelled {
+                let catalog = await ChatEmoteCatalog.shared.load(channelID: id)
+                guard let self, !self.stopped, !Task.isCancelled, self.appearance.emotes, self.emoteChannelID == id else { return }
+                self.pendingCatalog = catalog
+                let loaded = "\(catalog.global.count) global and \(catalog.channel.count) channel emotes. Static images; refreshed every 30 minutes."
+                self.onEmoteStatus?(catalog.unavailable.isEmpty ? loaded : loaded + " Unavailable: " + catalog.unavailable.joined(separator: ", ") + ". Unknown codes stay as text.")
+                self.scheduleRender()
+                do { try await Task.sleep(for: .seconds(1800)) } catch { return }
+            }
+        }
     }
 
     func stop() {
         guard !stopped else { return }
         stopped = true
+        feed?.stop(); feed = nil
+        emoteTask?.cancel(); emoteTask = nil; pendingCatalog = nil
+        renderTask?.cancel(); renderTask = nil
+        pendingEvents.removeAll(); pendingStatus = nil
         timer?.invalidate()
         timer = nil
-        feedTask?.cancel(); feedTask = nil
         webView.stopLoading()
         webView.navigationDelegate = nil
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "chatDirty")
@@ -97,7 +182,7 @@ final class Chat: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
         let settings = WKSnapshotConfiguration()
         settings.rect = webView.bounds
         // The first image establishes the actual NSImage backing scale. WKWebView
-        // takes this value in logical points; the resulting CGImage is 384x1080.
+        // takes this value in logical points; output uses the configured pixel width.
         if let scale = imageScale, scale > 0 {
             settings.snapshotWidth = NSNumber(value: Double(width) / scale)
         }
@@ -119,7 +204,7 @@ final class Chat: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
                     self.imageScale = Double(cgImage.width) / Double(image.size.width)
                 }
                 // Do not publish the scale-discovery frame: callers always receive
-                // the contract's 384x1080 pixel image.
+                // the configured width × 1080 pixel image.
                 guard cgImage.width == Int(self.width), cgImage.height == Int(Self.height) else {
                     self.dirty = true
                     self.scheduleSnapshot()
@@ -140,45 +225,50 @@ final class Chat: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
         error = failure
         fputs("chat snapshot failed: \(failure)\n", stderr)
     }
-
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         ready = true
         markDirty()
-        startFeed()
+        scheduleRender()
+        feed?.start()
     }
 
-    private func startFeed() {
-        guard feedTask == nil, let url = feedURL, ["http", "https"].contains(url.scheme ?? ""), url.host != nil else { return }
-        feedTask = Task { [weak self] in
-            let session = URLSession(configuration: .ephemeral)
-            defer { session.invalidateAndCancel() }
-            while !Task.isCancelled {
-                do {
-                    var request = URLRequest(url: url)
-                    request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-                    let (bytes, response) = try await session.bytes(for: request)
-                    guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
-                    await self?.runScript("window.setStatus('CONNECTED')", arguments: [:])
-                    var decoder = SSEDecoder()
-                    for try await byte in bytes {
-                        try Task.checkCancellation()
-                        if let data = try decoder.append(byte),
-                           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                            await self?.runScript("window.render(message)", arguments: ["message": object])
-                        }
+    private func scheduleRender() {
+        guard !stopped, ready, renderTask == nil else { return }
+        renderTask = Task { [weak self] in
+            guard let self else { return }
+            defer { self.renderTask = nil }
+            while !self.stopped && (!self.pendingEvents.isEmpty || self.pendingStatus != nil || self.appearanceDirty || self.pendingCatalog != nil) {
+                let events = self.pendingEvents
+                let status = self.pendingStatus ?? self.connectionStatus
+                self.pendingEvents.removeAll()
+                self.pendingStatus = nil
+                if self.appearanceDirty {
+                    self.appearanceDirty = false
+                    if let data = try? JSONEncoder().encode(self.appearance),
+                       let options = try? JSONSerialization.jsonObject(with: data) {
+                        await self.runScript("window.configureChat(options)", arguments: ["options": options])
                     }
-                } catch { if Task.isCancelled { return } }
-                await self?.runScript("window.setStatus('DISCONNECTED · RETRYING')", arguments: [:])
-                do { try await Task.sleep(for: .seconds(2)) } catch { return }
+                }
+                if let catalog = self.pendingCatalog {
+                    self.pendingCatalog = nil
+                    if let data = try? JSONEncoder().encode(catalog),
+                       let value = try? JSONSerialization.jsonObject(with: data) {
+                        await self.runScript("window.setEmoteCatalog(catalog)", arguments: ["catalog": value])
+                    }
+                }
+                await self.runScript("window.applyChatEvents(events); window.setStatus(status); if (transcript) return window.chatTranscript()",
+                                     arguments: ["events": events, "status": status, "transcript": self.onTranscript != nil])
             }
         }
     }
+
 
     private func runScript(_ script: String, arguments: [String: Any]) async {
         guard !stopped else { return }
         await withCheckedContinuation { continuation in
             webView.callAsyncJavaScript(script, arguments: arguments, in: nil, in: .page) { [weak self] result in
                 if case .failure(let error) = result { self?.error = error }
+                if case .success(let text as String) = result, self?.stopped == false { self?.onTranscript?(text) }
                 continuation.resume()
             }
         }
@@ -202,8 +292,7 @@ final class Chat: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
         markDirty()
     }
 
-    // The fixture is DOM-driven. Canvas/GIF/video paint changes are not generic
-    // DOM invalidations and require explicit dirty signaling from their renderer.
+    // Text and static emotes only: no animation polling or perpetual snapshot loop.
     private static let dirtyScript = #"""
     (() => {
       const notify = () => window.webkit.messageHandlers.chatDirty.postMessage(1);
@@ -214,25 +303,8 @@ final class Chat: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
       addEventListener('load', e => {
         if (e.target && e.target !== document) notify();
       }, true);
-      let raf = 0;
-      let lastNotify = -Infinity;
-      const pulse = now => {
-        raf = 0;
-        if (document.getAnimations().some(animation => animation.playState === 'running')) {
-          if (now - lastNotify >= 33) { lastNotify = now; notify(); }
-          raf = requestAnimationFrame(pulse);
-        } else { notify(); }
-      };
-      const start = () => { notify(); if (!raf) raf = requestAnimationFrame(pulse); };
-      const end = notify;
-      addEventListener('animationstart', start, true);
-      addEventListener('transitionstart', start, true);
-      addEventListener('animationend', end, true);
-      addEventListener('animationcancel', end, true);
-      addEventListener('transitionend', end, true);
-      addEventListener('transitioncancel', end, true);
       if (document.fonts) document.fonts.ready.then(notify, notify);
-      start();
+      notify();
     })();
     """#
 

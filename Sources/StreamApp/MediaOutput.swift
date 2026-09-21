@@ -181,7 +181,7 @@ final class MediaOutput {
                     }
             }
             if !synthetic && configuration.microphoneEnabled { try await enableMicrophone(configuration.microphoneID) }
-            state.setStatus(configuration.twitchTestMode ? "Twitch bandwidth test active · Inspector metrics" : (configuration.streamingEnabled ? "Output active · RTMP enabled" : "Recording"))
+            state.setStatus(configuration.outputSummary)
         } catch { await stop(); throw error }
     }
 

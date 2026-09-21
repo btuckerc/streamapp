@@ -1,24 +1,272 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'"><title>StreamApp Chat</title>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src https://static-cdn.jtvnw.net https://cdn.7tv.app https://cdn.betterttv.net https://cdn.frankerfacez.com; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<title>StreamApp Chat</title>
 <style>
-*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:transparent;color:#f1f5ff;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.chat{height:100vh;display:flex;flex-direction:column;background:transparent;border-left:1px solid rgba(170,190,220,.55);text-shadow:0 2px 4px #000}.head{padding:18px;border-bottom:1px solid rgba(170,190,220,.45);font-size:18px;letter-spacing:.04em}.messages{flex:1;min-height:0;overflow:hidden;padding:16px}.message{margin:0 0 16px;font-size:20px;line-height:1.35;overflow-wrap:anywhere}.name{font-weight:700;color:#a8d8ff}.body{color:#fff}.command .body{color:#d1edff}.response{display:block;padding-left:16px;color:#d0f4dc}.footer{padding:12px 16px;font-size:12px;color:#c7d5ec;border-top:1px solid rgba(170,190,220,.45)}.empty{color:#d6e2f7;font-size:17px;line-height:1.5}
-</style></head><body><main class="chat"><header class="head"># chat</header><section class="messages" id="messages"><p class="empty" id="empty">Waiting for chat…</p></section><footer class="footer" id="status">CONNECTING</footer></main>
+* { box-sizing: border-box; }
+:root { --size: 24px; --background: #10151c; --text: #f1f5f9; --muted: #bdc9d8; --accent: #8ae6bd; }
+html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: transparent; }
+body { color: var(--text); font: var(--size)/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.chat { height: 100%; display: flex; flex-direction: column; background: var(--background); border-inline-start: 1px solid #526174; }
+.head, .footer { flex: none; padding: 16px; overflow-wrap: anywhere; }
+.head { border-bottom: 1px solid #526174; font-size: max(20px, .85em); font-weight: 600; }
+.prompt { color: var(--accent); }
+.messages { flex: 1; min-height: 0; overflow: hidden; padding: 16px; }
+.history { min-height: 100%; display: flex; flex-direction: column; justify-content: flex-end; gap: 14px; }
+.message { flex: none; overflow-wrap: anywhere; white-space: pre-wrap; unicode-bidi: plaintext; }
+.name { font-weight: 700; }
+.body { color: var(--text); }
+.command, .mention { color: var(--accent); font-weight: 600; }
+.mention { text-decoration: underline; text-underline-offset: .15em; }
+.source, .timestamp { color: var(--muted); font-size: max(20px, .8em); }
+.source { display: block; }
+.timestamp { margin-inline-end: .6em; }
+.emote { height: 1.35em; object-fit: contain; vertical-align: -.3em; max-width: 100%; }
+.emote-stack { display: inline-block; position: relative; vertical-align: -.3em; height: 1.35em; max-width: 100%; }
+.emote-stack .emote { vertical-align: top; }
+.emote-stack .layer { position: absolute; bottom: 0; left: 50%; transform: translateX(-50%); max-width: none; }
+.empty { color: var(--muted); margin: 0; }
+.footer { color: var(--muted); border-top: 1px solid #526174; font-size: max(20px, .8em); }
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main class="chat" aria-label="Twitch chat">
+  <header class="head" id="head"><span class="prompt" aria-hidden="true">&gt; </span><span id="channel">#chat</span></header>
+  <section class="messages" id="messages" aria-label="Messages"><div class="history" id="history"></div></section>
+  <footer class="footer" id="status" hidden>CONNECTING</footer>
+</main>
 <script>
 'use strict';
-const box=document.getElementById('messages');
-const status=document.getElementById('status');
-let lastStatus='';
-window.setStatus = value => { const next=String(value).slice(0,100); if(next!==lastStatus){ lastStatus=next; status.textContent=next; } };
-window.render = m => {
- if(!m || typeof m !== 'object')return;
- document.getElementById('empty')?.remove();
- const d=document.createElement('article');d.className='message'+(m.is_command?' command':'');
- const n=document.createElement('span');n.className='name';
- const user=m.user&&typeof m.user==='object'?m.user:{};
- if(/^#[0-9a-f]{6}$/i.test(user.color||''))n.style.color=user.color;
- n.textContent='['+String(user.display_name||user.username||m.author||'viewer').slice(0,100)+'] ';
- const b=document.createElement('span');b.className='body';b.textContent=String(m.content||m.text||'').slice(0,2000);d.append(n,b);
- if(m.is_command&&m.response){const r=document.createElement('span');r.className='response';r.textContent='↳ '+String(m.response).slice(0,2000);d.append(r)}
- box.append(d);while(box.children.length>100)box.firstChild.remove();box.scrollTop=box.scrollHeight;
+const viewport = document.getElementById('messages');
+const history = document.getElementById('history');
+const status = document.getElementById('status');
+const entries = new Map();
+const colors = new Map();
+const globalEmotes = new Map(), channelEmotes = new Map();
+const imageHosts = new Set(['static-cdn.jtvnw.net', 'cdn.7tv.app', 'cdn.betterttv.net', 'cdn.frankerfacez.com']);
+let settleQueued = false;
+const clock = new Intl.DateTimeFormat(undefined, {hour: '2-digit', minute: '2-digit', hour12: false});
+let channel = 'chat';
+let options = {fontSize: 24, userColors: true, timestamps: false, showHeader: true, showStatus: false, solidBackground: true, emotes: true, highlights: true};
+const bounded = (value, limit) => String(value ?? '').slice(0, limit);
+const luminance = rgb => rgb.map(v => v / 255).map(v => v <= .04045 ? v / 12.92 : ((v + .055) / 1.055) ** 2.4).reduce((sum, v, i) => sum + v * [.2126, .7152, .0722][i], 0);
+
+function nameColor(value) {
+  if (!options.userColors || !/^#[0-9a-f]{6}$/i.test(value || '')) return '#f1f5f9';
+  const key = value.toLowerCase();
+  if (colors.has(key)) return colors.get(key);
+  const rgb = [1, 3, 5].map(i => parseInt(key.slice(i, i + 2), 16));
+  // Translucency is fixed at 90%. White behind it is the worst-case background.
+  const background = options.solidBackground ? [16, 21, 28] : [40, 45, 51];
+  const minimum = 4.5 * (luminance(background) + .05) - .05;
+  let result = key;
+  if (luminance(rgb) < minimum) {
+    let low = 0, high = 1;
+    for (let i = 0; i < 16; i++) {
+      const amount = (low + high) / 2;
+      if (luminance(rgb.map(v => v + (255 - v) * amount)) < minimum) low = amount;
+      else high = amount;
+    }
+    result = '#' + rgb.map(v => Math.ceil(v + (255 - v) * high).toString(16).padStart(2, '0')).join('');
+  }
+  if (colors.size >= 256) colors.delete(colors.keys().next().value);
+  colors.set(key, result);
+  return result;
+}
+
+function scheduleSettle() {
+  if (settleQueued) return;
+  settleQueued = true;
+  requestAnimationFrame(() => { settleQueued = false; settle(); });
+}
+
+function emoteImage(code, emote) {
+  const image = document.createElement('img'); image.className = 'emote'; image.alt = code;
+  image.dataset.aspect = String(emote.aspect);
+  image.style.width = (1.35 * emote.aspect) + 'em';
+  image.loading = 'lazy'; image.decoding = 'async'; image.referrerPolicy = 'no-referrer';
+  image.src = emote.url;
+  image.addEventListener('load', () => {
+    // Correct providers without reliable dimensions, once per actual image load.
+    if (image.naturalHeight) {
+      image.dataset.aspect = String(Math.min(6, Math.max(.25, image.naturalWidth / image.naturalHeight)));
+      image.style.width = (1.35 * Number(image.dataset.aspect) * Number(image.dataset.grow || 1)) + 'em';
+    }
+    scheduleSettle();
+  }, {once: true});
+  image.addEventListener('error', () => {
+    const stack = image.closest('.emote-stack');
+    if (stack) stack.replaceWith(document.createTextNode(stack.dataset.codes));
+    else image.replaceWith(document.createTextNode(code));
+    scheduleSettle();
+  }, {once: true});
+  return image;
+}
+
+function appendBody(body, message) {
+  const fragments = message.fragments.length ? message.fragments : [{text: message.text}];
+  const local = !message.sourceChannel || message.sourceChannel === channel;
+  let lastEmote = null, whitespace = [], first = true;
+  const text = value => { body.append(document.createTextNode(value)); lastEmote = null; whitespace = []; };
+  const image = (code, emote) => {
+    if (emote.zeroWidth && lastEmote?.parentNode === body) {
+      // Only adjacent emote tokens stack; never cross text or a line break.
+      for (const space of whitespace) space.remove();
+      whitespace = [];
+      if (lastEmote.tagName === 'IMG') {
+        const stack = document.createElement('span'); stack.className = 'emote-stack';
+        stack.dataset.codes = lastEmote.alt;
+        lastEmote.replaceWith(stack); stack.append(lastEmote); lastEmote = stack;
+      }
+      lastEmote.dataset.codes += ' ' + code;
+      const effects = Number(lastEmote.dataset.effects || 0) | (emote.effects || 0);
+      lastEmote.dataset.effects = String(effects);
+      lastEmote.style.transform = 'scale(' + (effects & 2 ? -1 : 1) + ',' + (effects & 4 ? -1 : 1) + ')';
+      const base = lastEmote.querySelector('img');
+      base.dataset.grow = effects & 8 ? '2' : '1';
+      base.style.width = (1.35 * Number(base.dataset.aspect) * Number(base.dataset.grow)) + 'em';
+      // Only still-image effects: no rainbow, shake, bounce or other animation.
+      lastEmote.style.filter = (effects & 4096 ? 'sepia(1) saturate(8) hue-rotate(320deg) contrast(1.4) ' : '') + (effects & 16384 ? 'grayscale(1) brightness(.8) contrast(2)' : '');
+      if (!(emote.effects & 1)) {
+        const node = emoteImage(code, emote); node.classList.add('layer'); lastEmote.append(node);
+      }
+    } else {
+      const node = emoteImage(code, emote); body.append(node); lastEmote = node; whitespace = [];
+    }
+  };
+  for (const fragment of fragments) {
+    if (options.emotes && /^[a-z0-9_-]{1,128}$/i.test(fragment.emoteID || '')) {
+      // Native Twitch occurrences win over all text-name lookups.
+      image(fragment.text, {url: 'https://static-cdn.jtvnw.net/emoticons/v2/' + fragment.emoteID + '/static/dark/2.0', aspect: 1, zeroWidth: false});
+      first = false; continue;
+    }
+    if (fragment.mention) {
+      const mention = document.createElement('span'); mention.className = options.highlights ? 'mention' : '';
+      mention.textContent = fragment.text; body.append(mention); lastEmote = null; whitespace = []; first = false; continue;
+    }
+    for (const token of fragment.text.split(/(\s+)/)) {
+      if (!token) continue;
+      if (/^\s+$/.test(token)) {
+        const space = document.createTextNode(token); body.append(space);
+        if (lastEmote && !token.includes('\n')) whitespace.push(space);
+        else { lastEmote = null; whitespace = []; }
+      } else {
+        const emote = options.emotes ? (local ? channelEmotes.get(token) : null) ?? globalEmotes.get(token) : null;
+        if (emote) image(token, emote);
+        else if (first && options.highlights && /^![a-z0-9_]+$/i.test(token)) {
+          const command = document.createElement('span'); command.className = 'command'; command.textContent = token;
+          body.append(command); lastEmote = null; whitespace = [];
+        } else text(token);
+      }
+      first = false;
+    }
+  }
+}
+
+function messageNode(message) {
+  const node = document.createElement('article'); node.className = 'message';
+  node.dataset.messageId = message.id; node.dataset.userId = message.userID;
+  if (options.timestamps && message.timestamp) {
+    const date = new Date(message.timestamp);
+    if (Number.isFinite(date.getTime())) {
+      const time = document.createElement('time'); time.className = 'timestamp';
+      time.dateTime = date.toISOString(); time.textContent = clock.format(date); node.append(time);
+    }
+  }
+  const name = document.createElement('bdi'); name.className = 'name'; name.style.color = nameColor(message.color);
+  name.textContent = '<' + (message.displayName || message.login || 'viewer') + '>'; node.append(name, ' ');
+  const body = document.createElement('span'); body.className = 'body';
+  appendBody(body, message);
+  node.append(body);
+  if (message.sourceChannel && message.sourceChannel !== channel) {
+    const source = document.createElement('span'); source.className = 'source'; source.textContent = '↳ #' + message.sourceChannel; node.append(source);
+  }
+  return node;
+}
+
+function settle() {
+  if (!entries.size && !document.getElementById('empty')) {
+    const empty = document.createElement('p'); empty.id = 'empty'; empty.className = 'empty'; empty.textContent = 'Waiting for chat…'; history.append(empty);
+  }
+  viewport.scrollTop = viewport.scrollHeight;
+}
+
+function rebuildMessages() {
+  history.replaceChildren();
+  for (const entry of entries.values()) { entry.node = messageNode(entry.message); history.append(entry.node); }
+  settle();
+}
+
+window.setEmoteCatalog = catalog => {
+  for (const [map, values] of [[globalEmotes, catalog.global], [channelEmotes, catalog.channel]]) {
+    map.clear();
+    for (const [code, emote] of Object.entries(values || {}).slice(0, 32768)) {
+      if (!code || code.length > 128 || /\s/.test(code) || !emote || !Number.isFinite(emote.aspect)) continue;
+      try {
+        const url = new URL(emote.url);
+        if (url.protocol !== 'https:' || !imageHosts.has(url.hostname) || url.username || url.password || url.search || url.hash || (url.port && url.port !== '443')) continue;
+        map.set(code, {url: url.href, aspect: Math.min(6, Math.max(.25, emote.aspect)), zeroWidth: emote.zeroWidth === true, effects: (Number.isInteger(emote.effects) ? emote.effects : 0) & 0x500f});
+      } catch {}
+    }
+  }
+  rebuildMessages();
 };
-</script></body></html>
+
+window.configureChat = value => {
+  for (const key of Object.keys(options)) {
+    if (key !== 'fontSize' && typeof value[key] === 'boolean') options[key] = value[key];
+  }
+  if (Number.isFinite(value.fontSize)) options.fontSize = Math.min(48, Math.max(20, value.fontSize));
+  document.documentElement.style.setProperty('--size', options.fontSize + 'px');
+  document.documentElement.style.setProperty('--background', options.solidBackground ? '#10151c' : 'rgba(16,21,28,.9)');
+  document.documentElement.style.setProperty('--accent', options.highlights ? '#8ae6bd' : '#f1f5f9');
+  document.getElementById('head').hidden = !options.showHeader;
+  status.hidden = !options.showStatus;
+  colors.clear();
+  rebuildMessages();
+};
+window.setStatus = value => {
+  const next = bounded(value, 100);
+  if (status.textContent !== next) status.textContent = next;
+};
+window.setChannel = value => {
+  channel = bounded(value || 'chat', 25);
+  document.getElementById('channel').textContent = '#' + channel;
+};
+window.applyChatEvents = events => {
+  for (const event of events) {
+    switch (event.type) {
+      case 'channel': window.setChannel(event.value); break;
+      case 'message': {
+        const id = bounded(event.id, 100);
+        if (!id || entries.has(id)) break;
+        const message = {
+          id, userID: bounded(event.userID, 100), login: bounded(event.login, 100), displayName: bounded(event.displayName, 100),
+          text: bounded(event.text, 2000), color: bounded(event.color, 7), sourceChannel: bounded(event.sourceChannel, 25), timestamp: bounded(event.timestamp, 64),
+          fragments: Array.isArray(event.fragments) ? event.fragments.slice(0, 128).filter(f => f && typeof f.text === 'string').map(f => ({text: bounded(f.text, 2000), emoteID: bounded(f.emoteID, 128), mention: f.mention === true})) : []
+        };
+        if (message.fragments.map(f => f.text).join('') !== message.text) message.fragments = [];
+        document.getElementById('empty')?.remove();
+        if (entries.size >= 100) { const oldest = entries.keys().next().value; entries.get(oldest).node.remove(); entries.delete(oldest); }
+        const node = messageNode(message); entries.set(id, {message, node}); history.append(node);
+        break;
+      }
+      case 'delete': { const entry = entries.get(event.value); if (entry) { entry.node.remove(); entries.delete(event.value); } break; }
+      case 'clearUser':
+        for (const [id, entry] of entries) if (entry.message.userID === event.value) { entry.node.remove(); entries.delete(id); }
+        break;
+      case 'clear': entries.clear(); history.replaceChildren(); break;
+    }
+  }
+  settle();
+};
+// A native, selectable text alternative; no HTML or bot-generated response markup.
+window.chatTranscript = () => Array.from(entries.values(), ({message: m}) => '<' + (m.displayName || m.login || 'viewer') + '> ' + m.text + (m.sourceChannel && m.sourceChannel !== channel ? ' (#' + m.sourceChannel + ')' : '')).join('\n\n');
+settle();
+</script>
+</body>
+</html>

@@ -10,6 +10,14 @@ final class PreviewFrames: @unchecked Sendable {
     private var serial: UInt64 = 0
     private var requested: Mode?
     private var mirrored = false
+    private var surfaces: [ObjectIdentifier: Mode] = [:]
+    func requestSurface(_ owner: ObjectIdentifier, mode: Mode?) {
+        lock.lock(); defer { lock.unlock() }
+        surfaces[owner] = mode
+        let next = mode ?? surfaces.values.first
+        guard requested != next else { return }
+        requested = next; buffer = nil; serial &+= 1
+    }
     var mode: Mode? { lock.lock(); defer { lock.unlock() }; return requested }
     func request(_ mode: Mode?) {
         lock.lock(); defer { lock.unlock() }
@@ -58,6 +66,7 @@ final class PreviewSurface: MTKView, MTKViewDelegate {
         imageContext = CIContext(mtlDevice: device, options: [.cacheIntermediates: false])
         super.init(frame: .zero, device: device)
         framebufferOnly = false; colorPixelFormat = .bgra8Unorm
+        presentsWithTransaction = true
         preferredFramesPerSecond = 30; isPaused = true
         enableSetNeedsDisplay = false; delegate = self
         for name in [NSWindow.didChangeOcclusionStateNotification, NSWindow.didMiniaturizeNotification, NSWindow.didDeminiaturizeNotification, NSView.boundsDidChangeNotification] {
@@ -76,18 +85,18 @@ final class PreviewSurface: MTKView, MTKViewDelegate {
         guard self.mode != mode else { return }
         self.mode = mode
         lastSerial = nil
-        if active { frames.request(mode) }
+        if active { frames.requestSurface(ObjectIdentifier(self), mode: mode) }
     }
     
     func refreshVisibility() {
         let visible = window?.occlusionState.contains(.visible) == true && !isHiddenOrHasHiddenAncestor && !visibleRect.isEmpty
         guard visible != active else { return }
         active = visible; isPaused = !visible; lastSerial = nil
-        frames.request(visible ? mode : nil)
+        frames.requestSurface(ObjectIdentifier(self), mode: visible ? mode : nil)
     }
     func stop() {
         isPaused = true; delegate = nil
-        if active { frames.request(nil) }; active = false
+        frames.requestSurface(ObjectIdentifier(self), mode: nil); active = false
         observers.forEach(NotificationCenter.default.removeObserver); observers.removeAll()
     }
     deinit { observers.forEach(NotificationCenter.default.removeObserver) }
@@ -107,9 +116,11 @@ final class PreviewSurface: MTKView, MTKViewDelegate {
             image = source.composited(over: image)
         }
         imageContext.render(image, to: drawable.texture, commandBuffer: command, bounds: bounds, colorSpace: color)
-        command.present(drawable)
         let slots = self.slots
         command.addCompletedHandler { [buffer] _ in withExtendedLifetime(buffer) { _ = slots.signal() } }
-        lastSerial = serial; command.commit()
+        lastSerial = serial
+        command.commit()
+        command.waitUntilScheduled()
+        drawable.present()
     }
 }

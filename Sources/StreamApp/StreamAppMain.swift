@@ -38,7 +38,7 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
             Task { await runSmoke(arguments) }
             return
         }
-        let annotations = AnnotationOverlay()
+        let annotations = AnnotationOverlay(settings: model.annotationSettings)
         self.annotations = annotations
         model.engine.annotationWindowID = annotations.canvasWindowID
         annotations.targetDisplay = { [weak self] in self?.model.configuration.displayID ?? CGMainDisplayID() }
@@ -95,6 +95,8 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
             else { window.contentView = NSHostingView(rootView: controls) }
             if let content = window.contentView { window.setContentSize(content.fittingSize) }
             window.isReleasedWhenClosed = false
+            window.delegate = self
+            if arguments.contains("--settings-smoke") { model.settingsVisible = true }
             window.orderBack(nil)
             inspectionWindow = window
         }
@@ -107,7 +109,10 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
     func applicationDidBecomeActive(_ notification: Notification) { model?.refreshAuthorization() }
 
     private var controls: StudioPopover {
-        StudioPopover(model: model, engine: model.engine, openSettings: { [weak self] in self?.showSettings() }, quit: { NSApplication.shared.terminate(nil) })
+        StudioPopover(model: model, engine: model.engine, openSettings: { [weak self] in self?.showSettings() },
+                      openOnboarding: { [weak self] in self?.showOnboarding() },
+                      openStreamingSetup: { [weak self] in self?.showOnboarding(streamingOnly: true) },
+                      quit: { NSApplication.shared.terminate(nil) })
     }
 
     @objc private func togglePopover() {
@@ -186,19 +191,22 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
         if settingsWindow == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 642, height: 620), styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
             window.title = "StreamApp Settings"; window.isReleasedWhenClosed = false
+            window.delegate = self
             window.contentView = NSHostingView(rootView: StudioSettings(model: model, engine: model.engine, openOnboarding: { [weak self] in self?.showOnboarding() }))
             window.center(); settingsWindow = window
         }
         settingsWindow?.makeKeyAndOrderFront(nil)
+        model.settingsVisible = true
         NSApplication.shared.activate(ignoringOtherApps: true)
     }
 
-    private func showOnboarding(activate: Bool = true) {
+    private func showOnboarding(activate: Bool = true, streamingOnly: Bool = false) {
         guard !model.engine.isRunning, !model.busy else {
             model.message = "Stop the current session before opening setup."
             return
         }
         popover.performClose(nil)
+        if streamingOnly { onboardingWindow?.close(); onboardingWindow = nil }
         if onboardingWindow == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 640),
                                   styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
@@ -207,7 +215,7 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
             window.delegate = self
             window.contentView = NSHostingView(rootView: StudioOnboarding(model: model, engine: model.engine, onFinish: { [weak self] in
                 self?.onboardingWindow?.performClose(nil)
-            }))
+            }, streamingOnly: streamingOnly))
             if let content = window.contentView { window.setContentSize(content.fittingSize) }
             window.center()
             onboardingWindow = window
@@ -234,9 +242,24 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
     }
 
     func windowWillClose(_ notification: Notification) {
+        if let window = notification.object as? NSWindow, window === settingsWindow || window === inspectionWindow {
+            model.settingsVisible = false
+        }
         if let window = notification.object as? NSWindow, window === onboardingWindow {
             // Reopening setup starts at Connect while retaining saved choices.
             onboardingWindow = nil
+        }
+    }
+
+    func windowDidMiniaturize(_ notification: Notification) {
+        if let window = notification.object as? NSWindow, window === settingsWindow {
+            model.settingsVisible = false
+        }
+    }
+
+    func windowDidDeminiaturize(_ notification: Notification) {
+        if let window = notification.object as? NSWindow, window === settingsWindow {
+            model.settingsVisible = true
         }
     }
 
@@ -256,6 +279,7 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
         Task {
             while model.busy { try? await Task.sleep(for: .milliseconds(50)) }
             await model.engine.setMenuPreview(visible: false, configuration: model.configuration, synthetic: model.demo)
+            await model.engine.setSettingsPreview(visible: false, configuration: model.configuration, synthetic: model.demo)
             await model.engine.stop()
             sender.reply(toApplicationShouldTerminate: true)
         }
