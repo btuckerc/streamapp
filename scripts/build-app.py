@@ -12,7 +12,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser()
-parser.add_argument('--identity', help='Persistent Apple signing identity; - explicitly requests a development-only ad-hoc build')
+parser.add_argument('--identity', help='Optional Apple signing identity; defaults to the local pin or - for an ad-hoc build')
 parser.add_argument('--install', action='store_true', help='Install the verified bundle into ~/Applications')
 parser.add_argument('--release', action='store_true', help='Build a notarization-ready Developer ID bundle without installing or changing the local signing pin')
 parser.add_argument('--version', help='Release marketing version (X.Y.Z)')
@@ -43,8 +43,8 @@ def run(*args):
         raise SystemExit(error.output.rstrip() or f'{args[0]} failed ({error.returncode})') from error
 
 
-# Development builds retain the existing pin policy; release builds explicitly
-# require Developer ID and never read or write the development pin.
+# Local builds need no certificate; retain an existing pin unless explicitly overridden.
+# Release builds require Developer ID and never read or write the development pin.
 pin = ROOT / '.local/macos-signing-identity'
 requested = a.identity or os.environ.get('APPLE_SIGNING_IDENTITY')
 if a.release:
@@ -58,22 +58,14 @@ if a.release:
     requested = matches[0][0]
 else:
     pinned = pin.read_text().strip() if pin.exists() else None
-    if requested == '-':
-        if a.install:
-            raise SystemExit('Installed builds require a persistent signing identity, not ad-hoc signing.')
-    else:
+    requested = requested or pinned or '-'
+    if requested != '-':
         identities = re.findall(r'\d+\) ([A-Fa-f0-9]{40}) "((?:Apple Development:|Developer ID Application:)[^"]+)"',
                                 run('security', 'find-identity', '-v', '-p', 'codesigning'))
-        selected = requested or pinned
-        if selected:
-            matches = [(key, name) for key, name in identities if selected in (key, name)]
-            if len(matches) != 1:
-                raise SystemExit('Selected signing identity unavailable or ambiguous; specify its SHA-1 fingerprint.')
-            requested = matches[0][0]
-        elif identities and len({name for _, name in identities}) == 1:
-            requested = sorted(key for key, _ in identities)[0]
-        else:
-            raise SystemExit('Select a persistent identity with --identity. No ad-hoc fallback.')
+        matches = [(key, name) for key, name in identities if requested in (key, name)]
+        if len(matches) != 1:
+            raise SystemExit('Selected signing identity unavailable or ambiguous; specify its SHA-1 fingerprint or use --identity - for a local ad-hoc build.')
+        requested = matches[0][0]
         if pinned and pinned != requested:
             raise SystemExit('Identity differs from the local pin. Migrate signing intentionally before rebuilding.')
         pin.parent.mkdir(exist_ok=True)
@@ -112,8 +104,8 @@ info = {
     'CFBundleName': 'StreamApp', 'CFBundleDisplayName': 'StreamApp',
     'CFBundleIdentifier': 'dev.streamapp.studio', 'CFBundleExecutable': 'StreamApp',
     'CFBundlePackageType': 'APPL',
-    'CFBundleShortVersionString': a.version if a.release else '1.2.0',
-    'CFBundleVersion': a.build_number if a.release else '7',
+    'CFBundleShortVersionString': a.version if a.release else '1.2.1',
+    'CFBundleVersion': a.build_number if a.release else '8',
     'CFBundleIconFile': 'StreamApp.icns',
     'LSMinimumSystemVersion': '26.0', 'LSUIElement': True, 'NSHighResolutionCapable': True,
     'NSCameraUsageDescription': 'StreamApp uses the camera you enable in your broadcast layout.',
@@ -215,7 +207,8 @@ else:
         shutil.rmtree(app)
     staging.rename(app)
 print(f'Built {app} ({len(copied)} bundled dynamic libraries)')
-print('Local ad-hoc build; not notarized.' if a.identity == '-' else 'Persistently signed local build; not notarized.')
+print('Local ad-hoc build; not notarized. macOS permissions may need reapproval after rebuilding.'
+      if a.identity == '-' else 'Persistently signed local build; not notarized.')
 if a.install:
     if subprocess.run(['pgrep', '-x', 'StreamApp'], capture_output=True).returncode == 0:
         raise SystemExit('Quit StreamApp before installing. The verified new build remains at the project root.')

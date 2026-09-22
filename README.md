@@ -14,14 +14,18 @@ The release app is Developer ID signed, notarized, and stapled. No Apple develop
 
 ### Build from source
 
-Source builds require macOS 26 or newer, Xcode, Python 3, Homebrew, and an Apple signing certificate (or the local ad-hoc development signing option). With [Homebrew](https://brew.sh) installed, run these commands in this folder:
+Source builds require macOS 26 or newer, Xcode, Python 3, and Homebrew. **No Apple signing certificate is required.** With [Homebrew](https://brew.sh) installed, quit any running StreamApp instance and run:
 
 ```sh
 brew install ffmpeg pkg-config
 python3 scripts/build-app.py --install
 ```
 
-Open **StreamApp** in your home folder’s **Applications** folder.
+Open **StreamApp** in your home folder’s **Applications** folder. To build without installing, omit `--install`; the app is created in the project folder.
+
+Fresh checkouts use local ad-hoc signing automatically. You can also request it explicitly with `--identity -`, including with `--install`. These builds are not notarized for distribution, and macOS permissions may need reapproval after rebuilding.
+
+An optional `--identity` or `APPLE_SIGNING_IDENTITY` selects an installed Apple Development or Developer ID Application certificate. Existing local signing pins are preserved, so established developer builds keep their stable identity; an unavailable selected certificate fails rather than silently switching identities. Use `--identity -` to opt out for a local build without changing the pin.
 
 ## Developer ID release build
 
@@ -30,7 +34,7 @@ Release mode requires an installed **Developer ID Application** certificate and 
 ```sh
 python3 scripts/build-app.py --release \
   --identity "Developer ID Application: Your Name (TEAMID)" \
-  --version 1.2.0 --build-number 7 --output /absolute/path/StreamApp.app
+  --version 1.2.1 --build-number 8 --output /absolute/path/StreamApp.app
 ```
 
 The output path must not already exist. FFmpeg is bundled from Homebrew with its dependency graph and build configuration recorded in the app; the current GPL/version-3 configuration requires corresponding source and applicable license notices for any redistribution. A nonfree FFmpeg configuration is refused.

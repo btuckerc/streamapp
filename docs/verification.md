@@ -1,5 +1,15 @@
 # Verification — 2026-09-20
 
+## Certificate-free local builds and release-download investigation
+
+- A clean source copy without `.local/macos-signing-identity` or `APPLE_SIGNING_IDENTITY` built successfully with plain `python3 scripts/build-app.py`. Its 17 bundled libraries and app passed strict deep signing verification; the app reports an ad-hoc signature.
+- `--install` also completed into an isolated `HOME/Applications`. Only the running-process check was simulated as “no StreamApp running” to avoid disturbing the actual installed app; compilation, signing, bundle copying and installation were real. The actual installed executable and local signing pin remained unchanged.
+- The installed ad-hoc bundle passed the packaged synthetic smoke: scenes, chat/camera toggles, audio controls, clean stop and restart. Both recordings fully decoded without errors, backwards DTS or duplicate PTS: 488 video / 763 audio packets, then 91 video / 143 audio packets. Evidence remains in ignored `.build/local-signing-smoke/`.
+- Release mode rejected missing, ad-hoc and unavailable Developer ID identities. An explicitly unavailable local identity also failed rather than silently falling back to ad-hoc signing.
+- A fresh download of `streamapp-1.2.0-7-macos-arm64.zip` from GitHub matched SHA-256 `e6fbf9951cd18a834171c38d048e436417999130a766d0bd7f17314310736cb0`. After extraction, strict deep signature verification, stapled-ticket validation, uncached Gatekeeper assessment (`Notarized Developer ID`) and `syspolicy_check distribution` passed on this development Mac.
+- Dependency inspection covered all 19 Mach-O files in the downloaded ZIP. Every non-system load dependency resolved inside the bundle; no missing dependency, broken symlink or escaping symlink was found.
+- The user retried the release ZIP and still encountered a download/open error, while building and installing locally worked. The original dialog is no longer available. The release failure's cause remains unidentified; development-Mac checks do not establish clean-machine launch success. No Gatekeeper bypass, quarantine removal, permission grant, public release replacement or change to the user's installed app was performed.
+
 ## Physical-notch teleprompter
 
 - `swift test` passed 54 tests in 11 suites. Seven teleprompter regressions cover lossless three-line wrapping (multilingual and unbroken text), Markdown cue/emphasis rendering, page retention, reload/error replacement, six-message moderation/late events, independent body/handle privacy and older-settings migration.
