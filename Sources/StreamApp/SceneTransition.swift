@@ -18,8 +18,17 @@ struct SceneGeometry: Equatable {
         } else {
             desktop = CGRect(x: c.chatOnLeft ? width : 0, y: 0, width: 1920 - width, height: 1080)
             chat = CGRect(x: c.chatOnLeft ? 0 : desktop.width, y: 0, width: width, height: 1080)
-            let w = desktop.width * c.effectiveCameraSize
-            let h = w * 9 / 16
+            let size = CGFloat(c.effectiveCameraSize)
+            let heightBasedFrame = c.cameraFrame != .widescreen
+            let w: CGFloat
+            let h: CGFloat
+            if heightBasedFrame {
+                h = min(desktop.height * size, desktop.height - 48)
+                w = h * c.cameraFrame.aspectRatio
+            } else {
+                w = min(desktop.width * size, (desktop.height - 48) * c.cameraFrame.aspectRatio)
+                h = w / c.cameraFrame.aspectRatio
+            }
             let left = c.cameraCorner == .bottomLeft || c.cameraCorner == .topLeft
             let top = c.cameraCorner == .topLeft || c.cameraCorner == .topRight
             camera = CGRect(x: left ? desktop.minX + 24 : desktop.maxX - w - 24,

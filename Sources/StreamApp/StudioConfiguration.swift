@@ -12,6 +12,14 @@ enum CameraCorner: String, Codable, CaseIterable, Identifiable {
     var id: String { rawValue }
     var title: String { switch self { case .bottomRight: "Bottom right"; case .bottomLeft: "Bottom left"; case .topRight: "Top right"; case .topLeft: "Top left" } }
 }
+enum CameraFrame: String, Codable, CaseIterable, Identifiable {
+    case widescreen, square, circle
+    var id: String { rawValue }
+    var title: String {
+        switch self { case .widescreen: "Wide"; case .square: "Square"; case .circle: "Circle" }
+    }
+    var aspectRatio: CGFloat { self == .widescreen ? 16 / 9 : 1 }
+}
 enum OutputMode: String, CaseIterable, Identifiable {
     case record, stream, both
     var id: String { rawValue }
@@ -21,6 +29,19 @@ enum StreamService: String, Codable, CaseIterable, Identifiable {
     case twitch, custom
     var id: String { rawValue }
     var title: String { self == .twitch ? "Twitch account" : "Custom RTMP" }
+}
+/// Local recording container. Both hold the same H.264 + AAC streams and survive a crash mid-recording.
+enum RecordingFormat: String, Codable, CaseIterable, Identifiable {
+    /// FFmpeg `hybrid_fragmented`: written as fragmented MP4 (recoverable), finalized as a regular MP4
+    /// that QuickTime, Finder previews, Photos, and editors open directly.
+    case mp4
+    /// Matroska: recoverable, but QuickTime and Finder cannot play it.
+    case mkv
+    var id: String { rawValue }
+    var title: String { self == .mp4 ? "MP4" : "MKV" }
+    var fileExtension: String { rawValue }
+    /// Tee-muxer slave options for the recording output.
+    var teeOptions: String { self == .mp4 ? "f=mp4:movflags=+hybrid_fragmented" : "f=matroska" }
 }
 enum TeleprompterMode: String, Codable, CaseIterable, Identifiable {
     case off, transcript, twitchChat
@@ -122,8 +143,9 @@ struct StudioConfiguration: Codable, Equatable {
     var cameraEnabled = false
     var cameraID = ""
     var cameraCorner: CameraCorner = .bottomRight
-    var cameraSize = 0.22
-    var cameraPunchInSize = 0.52
+    var cameraSize = 0.25
+    var cameraFrame: CameraFrame = .widescreen
+    var cameraPunchInSize = 0.5
     /// Session-only emphasis; intentionally excluded from Codable persistence.
     var cameraPunchIn = false
     var effectiveCameraSize: Double {
@@ -146,6 +168,10 @@ struct StudioConfiguration: Codable, Equatable {
     var microphoneGain = 1.0
     var microphoneMuted = false
     var microphoneCompressionEnabled = true
+    // Optional AEC3 cleanup for the mic; the raw system-broadcast tap is never altered.
+    var microphoneEchoCancellationEnabled = false
+    // Optional hiss/fan reduction, independent of echo cancellation and compression.
+    var microphoneNoiseReductionEnabled = false
     var systemAudioEnabled = true
     // Empty captures all other apps; a bundle ID isolates music from unrelated apps.
     var systemAudioApplicationID = ""
@@ -153,6 +179,7 @@ struct StudioConfiguration: Codable, Equatable {
     var systemAudioMuted = false
     var recordingEnabled = true
     var recordingDirectory = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Movies/StreamApp").path
+    var recordingFormat: RecordingFormat = .mp4
     var streamingEnabled = false
     var streamService: StreamService = .twitch
     var streamURL = ""
@@ -184,12 +211,13 @@ struct StudioConfiguration: Codable, Equatable {
 
     init() {}
     private enum CodingKeys: String, CodingKey {
-        case layout, displayID, windowID, cameraEnabled, cameraID, cameraCorner, cameraSize, mirrorCamera, chatOnLeft, chatWidth, chatEnabled, twitchChatChannel, microphoneEnabled, microphoneID, microphoneGain, microphoneMuted, microphoneCompressionEnabled, systemAudioEnabled, systemAudioGain, systemAudioMuted, recordingEnabled, recordingDirectory, streamingEnabled, streamService, streamURL, twitchTestMode, excludedApplicationIDs
-        case cameraPunchInSize
+        case layout, displayID, windowID, cameraEnabled, cameraID, cameraCorner, cameraSize, mirrorCamera, chatOnLeft, chatWidth, chatEnabled, twitchChatChannel, microphoneEnabled, microphoneID, microphoneGain, microphoneMuted, microphoneCompressionEnabled, microphoneEchoCancellationEnabled, microphoneNoiseReductionEnabled, systemAudioEnabled, systemAudioGain, systemAudioMuted, recordingEnabled, recordingDirectory, streamingEnabled, streamService, streamURL, twitchTestMode, excludedApplicationIDs
+        case cameraFrame, cameraPunchInSize
         case showStreamAppWindows
         case chatAppearance
         case teleprompterMode, teleprompterInCapture, transcriptPath
         case systemAudioApplicationID
+        case recordingFormat
         case includeMenuBar
         case backgroundStyle, backgroundRed, backgroundGreen, backgroundBlue, backgroundBlurRadius, backgroundImagePath
     }
@@ -211,6 +239,7 @@ struct StudioConfiguration: Codable, Equatable {
         cameraCorner = try values.decodeIfPresent(CameraCorner.self, forKey: .cameraCorner) ?? cameraCorner
         cameraSize = try values.decodeIfPresent(Double.self, forKey: .cameraSize) ?? cameraSize
         cameraPunchInSize = min(0.9, max(0.4, try values.decodeIfPresent(Double.self, forKey: .cameraPunchInSize) ?? cameraPunchInSize))
+        cameraFrame = try values.decodeIfPresent(CameraFrame.self, forKey: .cameraFrame) ?? cameraFrame
         mirrorCamera = try values.decodeIfPresent(Bool.self, forKey: .mirrorCamera) ?? mirrorCamera
         chatOnLeft = try values.decodeIfPresent(Bool.self, forKey: .chatOnLeft) ?? chatOnLeft
         chatWidth = try values.decodeIfPresent(Double.self, forKey: .chatWidth) ?? chatWidth
@@ -225,6 +254,8 @@ struct StudioConfiguration: Codable, Equatable {
         microphoneGain = try values.decodeIfPresent(Double.self, forKey: .microphoneGain) ?? microphoneGain
         microphoneMuted = try values.decodeIfPresent(Bool.self, forKey: .microphoneMuted) ?? microphoneMuted
         microphoneCompressionEnabled = try values.decodeIfPresent(Bool.self, forKey: .microphoneCompressionEnabled) ?? microphoneCompressionEnabled
+        microphoneEchoCancellationEnabled = try values.decodeIfPresent(Bool.self, forKey: .microphoneEchoCancellationEnabled) ?? microphoneEchoCancellationEnabled
+        microphoneNoiseReductionEnabled = try values.decodeIfPresent(Bool.self, forKey: .microphoneNoiseReductionEnabled) ?? microphoneNoiseReductionEnabled
         systemAudioApplicationID = try values.decodeIfPresent(String.self, forKey: .systemAudioApplicationID) ?? systemAudioApplicationID
         // Older audio followed visual exclusions/window selection. Require explicit
         // re-enabling rather than silently expanding that scope to all applications.
@@ -234,6 +265,8 @@ struct StudioConfiguration: Codable, Equatable {
         systemAudioMuted = try values.decodeIfPresent(Bool.self, forKey: .systemAudioMuted) ?? systemAudioMuted
         recordingEnabled = try values.decodeIfPresent(Bool.self, forKey: .recordingEnabled) ?? recordingEnabled
         recordingDirectory = try values.decodeIfPresent(String.self, forKey: .recordingDirectory) ?? recordingDirectory
+        // An unknown format (settings from a newer build) falls back rather than discarding every setting.
+        recordingFormat = (try? values.decodeIfPresent(RecordingFormat.self, forKey: .recordingFormat)) ?? recordingFormat
         streamingEnabled = try values.decodeIfPresent(Bool.self, forKey: .streamingEnabled) ?? streamingEnabled
         streamService = try values.decodeIfPresent(StreamService.self, forKey: .streamService) ?? .twitch
         if !recordingEnabled && !streamingEnabled { recordingEnabled = true }

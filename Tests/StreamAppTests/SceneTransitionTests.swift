@@ -46,6 +46,38 @@ struct SceneTransitionTests {
         #expect(full.camera == scene.desktop)
         #expect(full.chat.width == 0)
     }
+    @Test func desktopWebcamFramesChangeCropGeometryWithoutAffectingFullCamera() {
+        var c = StudioConfiguration()
+        c.cameraEnabled = true
+        c.chatEnabled = false
+        let wide = SceneGeometry(configuration: c)
+        #expect(abs(wide.camera.width / wide.camera.height - 16.0 / 9) < 0.000001)
+
+        c.cameraFrame = .square
+        let square = SceneGeometry(configuration: c)
+        #expect(square.camera.width == square.camera.height)
+        #expect(square.camera.height == square.desktop.height * 0.25)
+
+        c.cameraPunchIn = true
+        c.cameraPunchInSize = 0.5
+        let punchedSquare = SceneGeometry(configuration: c)
+        #expect(punchedSquare.camera.height == punchedSquare.desktop.height * 0.5)
+        #expect(punchedSquare.camera.width == punchedSquare.camera.height)
+
+        c.cameraFrame = .circle
+        let punchedCircle = SceneGeometry(configuration: c)
+        #expect(punchedCircle.camera == punchedSquare.camera)
+        #expect(punchedCircle.desktop.contains(punchedCircle.camera))
+
+        c.cameraPunchIn = false
+        let circle = SceneGeometry(configuration: c)
+        #expect(circle.camera == square.camera)
+
+
+        c.layout = .justChatting
+        #expect(SceneGeometry(configuration: c).camera == circle.desktop)
+    }
+
 
     @Test func webcamPunchKeepsItsCornerAndDoesNotDisplaceContent() {
         for corner in CameraCorner.allCases {
@@ -83,7 +115,9 @@ struct SceneTransitionTests {
         let normal = SceneGeometry(configuration: c)
         c.cameraPunchIn = true
         let punched = SceneGeometry(configuration: c)
+        #expect(normal.camera.width == normal.desktop.width * 0.25)
         var motion = SceneTransition()
+        #expect(punched.camera.width == punched.desktop.width * 0.5)
         _ = motion.sample(target: normal, now: 0, reduceMotion: false)
         #expect(motion.sample(target: punched, now: 1, reduceMotion: false) == normal)
         let middle = motion.sample(target: punched, now: 1.3, reduceMotion: false)
@@ -130,7 +164,7 @@ struct SceneTransitionTests {
         var c = try JSONDecoder().decode(StudioConfiguration.self, from: data)
         #expect(c.layout == .justChatting && c.cameraEnabled)
         #expect(c.microphoneGain == 0.75 && c.recordingDirectory == "/tmp/example")
-        #expect(!c.showStreamAppWindows)
+        #expect(!c.showStreamAppWindows && !c.microphoneNoiseReductionEnabled)
         c.showStreamAppWindows = true
         c.chatEnabled = false; c.excludedApplicationIDs = ["example.private"]
         c.excludedWindowIDs = [1234]
@@ -138,5 +172,8 @@ struct SceneTransitionTests {
         #expect(!restored.chatEnabled && restored.excludedApplicationIDs == ["example.private"])
         #expect(restored.excludedWindowIDs.isEmpty)
         #expect(restored.showStreamAppWindows)
+        c.cameraFrame = .circle
+        let styled = try JSONDecoder().decode(StudioConfiguration.self, from: JSONEncoder().encode(c))
+        #expect(styled.cameraFrame == .circle)
     }
 }

@@ -131,6 +131,7 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
         popover.delegate = self
         popover.animates = false
         let host = NSHostingController(rootView: controls)
+        host.sizingOptions = [.preferredContentSize]
         popoverHost = host
         popover.contentViewController = host
         stateSubscription = model.engine.$isRunning.sink { [weak self] running in
@@ -140,8 +141,15 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
         if arguments.contains("--ui-smoke") || arguments.contains("--settings-smoke") {
             let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 420, height: 780), styleMask: [.titled, .closable], backing: .buffered, defer: false)
             window.title = arguments.contains("--settings-smoke") ? "StreamApp Settings — Interface Check" : "StreamApp — Interface Check"
-            if arguments.contains("--settings-smoke") { window.contentView = NSHostingView(rootView: StudioSettings(model: model, engine: model.engine, openOnboarding: { [weak self] in self?.showOnboarding() })) }
-            else { window.contentView = NSHostingView(rootView: controls) }
+            if arguments.contains("--settings-smoke") {
+                window.toolbarStyle = .preference
+                window.contentView = NSHostingView(rootView: StudioSettings(model: model, engine: model.engine, openOnboarding: { [weak self] in self?.showOnboarding() }))
+            }
+            else {
+                window.contentView = NSHostingView(rootView: controls)
+                // Same live meters/preview as an opened popover (synthetic in smoke mode).
+                Task { await model.engine.setMenuPreview(visible: true, configuration: model.configuration, synthetic: model.demo) }
+            }
             if let content = window.contentView { window.setContentSize(content.fittingSize) }
             window.isReleasedWhenClosed = false
             window.delegate = self
@@ -181,7 +189,6 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
 
     private var controls: StudioPopover {
         StudioPopover(model: model, engine: model.engine, openSettings: { [weak self] in self?.showSettings() },
-                      openOnboarding: { [weak self] in self?.showOnboarding() },
                       openStreamingSetup: { [weak self] in self?.showOnboarding(streamingOnly: true) },
                       quit: { NSApplication.shared.terminate(nil) })
     }
@@ -189,15 +196,6 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
     @objc private func togglePopover() {
         if popover.isShown { popover.performClose(nil) }
         else if let button = item.button {
-            let anchor = button.window?.convertToScreen(button.convert(button.bounds, to: nil))
-            let screen = NSScreen.screens.first { screen in anchor.map { screen.frame.contains(NSPoint(x: $0.midX, y: $0.midY)) } ?? false } ?? NSScreen.main
-            let height = min(600, max(260, (screen?.visibleFrame.height ?? 640) - 40))
-            var content = controls
-            content.availableHeight = height
-            popoverHost?.rootView = content
-            popoverHost?.view.setFrameSize(NSSize(width: 420, height: height))
-            popoverHost?.view.layoutSubtreeIfNeeded()
-            popover.contentSize = NSSize(width: 420, height: height)
             NSApplication.shared.activate(ignoringOtherApps: true)
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         }
@@ -261,8 +259,9 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
     private func showSettings() {
         popover.performClose(nil)
         if settingsWindow == nil {
-            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 642, height: 620), styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 620), styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
             window.title = "StreamApp Settings"; window.isReleasedWhenClosed = false
+            window.toolbarStyle = .preference // centered pane tabs, as in system Settings windows
             window.delegate = self
             window.contentView = NSHostingView(rootView: StudioSettings(model: model, engine: model.engine, openOnboarding: { [weak self] in self?.showOnboarding() }))
             window.center(); settingsWindow = window
@@ -383,10 +382,11 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
             }
             model.engine.previewFrames.request(.program)
             try await model.engine.start(configuration: c, streamKey: "", synthetic: true)
-            for stage in 0..<4 {
+            for stage in 0..<5 {
                 if stage == 1 { c.layout = .justChatting; c.chatEnabled = false }
                 if stage == 2 { c.cameraEnabled = false; c.microphoneMuted = true; c.chatEnabled = true }
-                if stage == 3 { c.layout = .desktopChat; c.cameraEnabled = true; c.chatEnabled = false; c.chatOnLeft = true; c.cameraCorner = .topLeft; c.microphoneMuted = false; c.systemAudioGain = 0.5 }
+                if stage == 3 { c.layout = .desktopChat; c.cameraEnabled = true; c.cameraFrame = .circle; c.chatEnabled = false; c.chatOnLeft = true; c.cameraCorner = .topLeft; c.microphoneMuted = false; c.systemAudioGain = 0.5 }
+                if stage == 4 { c.cameraPunchIn = true }
                 try await model.engine.update(configuration: c)
                 try await Task.sleep(for: .seconds(stageSeconds))
                 guard model.engine.isRunning, model.engine.errorMessage == nil else { throw SmokeError.message(model.engine.errorMessage ?? "Session stopped") }

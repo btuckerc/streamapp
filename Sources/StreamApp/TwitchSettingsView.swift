@@ -38,7 +38,7 @@ struct TwitchConnectionView: View {
     private var connectionInfo: some View {
         Image(systemName: "info.circle")
             .foregroundStyle(.secondary)
-            .help("Twitch lets this app read chat and get your stream key. It cannot post chat messages. Connecting does not start a stream.")
+            .help("Reads chat and your stream key. Can't post messages or start a stream.")
             .accessibilityLabel("About Twitch connection")
     }
 }
@@ -62,33 +62,20 @@ struct TwitchChatSettings: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            TextField(session.account.map { "Chat channel (default: \($0.login))" } ?? "Chat channel", text: $channel)
-                .textFieldStyle(.roundedBorder).onSubmit { applyChannel() }.disabled(locked || checking)
-                .onChange(of: channel) { _, _ in channelError = nil }
+            if session.account == nil { TwitchConnectionView(session: session, locked: locked) }
             HStack {
+                TextField("Channel", text: $channel, prompt: Text(session.account.map { $0.login } ?? "Twitch username or link"))
+                    .onSubmit { applyChannel() }.disabled(locked || checking)
+                    .onChange(of: channel) { _, _ in channelError = nil }
                 if channel != model.configuration.twitchChatChannel {
                     Button(checking ? "Checking…" : "Apply") { applyChannel() }
                         .disabled(locked || checking)
                 }
-                Button("Test chat") { applyChannel(test: true) }
+                Button("Test") { applyChannel(test: true) }
                     .disabled(locked || checking || session.account == nil)
-                    .help("Shows chat without recording or streaming.")
+                    .help("Preview chat without recording or streaming")
             }
             if let channelError { Text(channelError).font(.caption).foregroundStyle(.orange) }
-            ClickableDisclosure("Appearance") {
-                ChatAppearanceControls(appearance: $model.configuration.chatAppearance)
-                    .disabled(model.busy)
-            }
-            ClickableDisclosure("Bot commands") {
-                Text("Handled by anglbot, not StreamApp.").foregroundStyle(.secondary)
-                LabeledContent("!help", value: "List available commands")
-                LabeledContent("!fish", value: "Catch a fish")
-                LabeledContent("!fish help", value: "Fishing odds")
-                Text("Also: !ping, !whoami, !groups, !history, !cowsay, !followage, !time, !song")
-                    .foregroundStyle(.secondary).textSelection(.enabled)
-                Text("The bot must be running in that channel. Its permissions, cooldowns, custom commands and profanity filter stay in anglbot. Charts and HTML replies are not embedded here.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
         }
         .onAppear { channel = model.configuration.twitchChatChannel }
         .onChange(of: model.configuration.twitchChatChannel) { _, value in channel = value }
@@ -127,11 +114,11 @@ struct TwitchChatSettings: View {
     }
 }
 
-private struct ChatAppearanceControls: View {
+struct ChatAppearanceControls: View {
     @Binding var appearance: ChatAppearance
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        Group {
             Picker("Preset", selection: Binding<ChatAppearance.Preset?>(
                 get: { appearance.preset },
                 set: { if let preset = $0 { appearance = preset.appearance } }
@@ -139,28 +126,23 @@ private struct ChatAppearanceControls: View {
                 if appearance.preset == nil { Text("Custom").tag(ChatAppearance.Preset?.none).disabled(true) }
                 ForEach(ChatAppearance.Preset.allCases) { preset in Text(preset.title).tag(Optional(preset)) }
             }
-            .help("Presets replace the appearance options below. Individual changes are kept as Custom.")
+            .help("Presets replace the options below; individual changes show as Custom.")
             HStack {
                 Text("Text size")
                 Slider(value: $appearance.fontSize, in: 20...48, step: 2)
                     .accessibilityLabel("Chat text size at 1080p")
                 Text("\(Int(appearance.fontSize)) px").monospacedDigit().frame(width: 48, alignment: .trailing)
-                Image(systemName: "info.circle").foregroundStyle(.secondary)
-                    .help("Pixels in the 1080p output, not the smaller preview. Default: 24 px. Smaller playback scales the text down too. Twitch has no prescribed overlay font size.")
-                    .accessibilityLabel("About chat text size")
-            }
+            }.help("Pixels at 1080p output. Default 24 px.")
             Toggle("Twitch name colors", isOn: $appearance.userColors)
-                .help("Keeps Twitch colors when readable; brightens dark colors to reach 4.5:1 contrast. Names remain bold when colors are off.")
+                .help("Dark colors are brightened for contrast.")
             Toggle("Emotes", isOn: $appearance.emotes)
-                .help("Twitch plus global and channel emotes from 7TV, BetterTTV and FrankerFaceZ. Static images keep chat lightweight. Codes are case-sensitive; unavailable images stay as text. Private/personal packs are not included.")
+                .help("Twitch, 7TV, BetterTTV, and FrankerFaceZ. Static images; codes are case-sensitive.")
             Toggle("Highlight commands & mentions", isOn: $appearance.highlights)
-                .help("Styles !commands and Twitch mentions. Does not run commands or send replies.")
             Toggle("Timestamps", isOn: $appearance.timestamps)
-                .help("Message time in your Mac’s local time zone.")
             Toggle("Channel heading", isOn: $appearance.showHeader)
             Toggle("Connection status", isOn: $appearance.showStatus)
             Toggle("Solid background", isOn: $appearance.solidBackground)
-                .help("Off uses a 90% dark background. Both modes keep text contrast even over bright scenes.")
+                .help("Off uses a 90% dark background.")
         }
     }
 }
@@ -195,7 +177,7 @@ private struct TwitchChatCheck: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("Read-only Twitch chat").font(.headline)
+                Text("Chat preview").font(.headline)
                 Spacer()
                 Button("Done") { dismiss() }
             }
@@ -214,7 +196,7 @@ private struct TwitchChatCheck: View {
                         .font(.system(size: 18, design: .monospaced)).textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading).padding(12)
                 }
-                .help("Selectable live text. Scroll manually; messages are still removed when moderated.")
+                .help("Selectable live text")
             } else {
                 ScrollView {
                     if let image = check.image {
@@ -226,8 +208,6 @@ private struct TwitchChatCheck: View {
                 .accessibilityLabel("Chat overlay preview. Choose Text for readable messages.")
             }
             ClickableDisclosure("Appearance") { ChatAppearanceControls(appearance: $appearance) }
-            Text("Live reception only. No messages sent. No recording or broadcast.")
-                .font(.caption).foregroundStyle(.secondary)
         }
         .padding(20).frame(width: CGFloat(max(424, width + 40)), height: 760)
         .onAppear { check.start(channel: channel, width: width, appearance: appearance) }

@@ -72,10 +72,25 @@ struct AudioMixerTests {
         var block = [Float](repeating: 0, count: 1920)
         for _ in 0..<12 { block.withUnsafeMutableBufferPointer { mixer.pull(into: $0) } }
         let levels = mixer.levels
-        #expect(abs(levels.microphone - 0.5) < 0.001)
-        #expect(abs(levels.output - 0.5) < 0.001)
+        #expect(abs(levels.microphone.peak - 0.5) < 0.001)
+        #expect(abs(levels.output.peak - 0.5) < 0.001)
         settings.microphoneMuted = true; mixer.configure(settings)
-        #expect(mixer.levels.microphone == 0)
+        #expect(mixer.levels.microphone == .silent)
+    }
+
+    @Test func loudnessMatchesBS1770CalibrationAndEBUWindows() {
+        // BS.1770: a 1 kHz sine in both channels reads its own dBFS level in LUFS.
+        let meter = LoudnessMeter()
+        for n in 0..<(3 * 48_000) {
+            let value = Float(0.1 * sin(2 * Double.pi * 1_000 * Double(n) / 48_000))
+            meter.process(left: value, right: value)
+        }
+        #expect(abs(meter.shortTerm + 20) < 0.1)
+        #expect(abs(meter.momentary + 20) < 0.1)
+        // 1.5 s of silence: momentary (400 ms) empties; short-term (3 s) keeps half the energy.
+        for _ in 0..<(3 * 24_000) { meter.process(left: 0, right: 0) }
+        #expect(meter.momentary < -60)
+        #expect(abs(meter.shortTerm + 23.01) < 0.1)
     }
 
     @Test func compressionIsStereoLinkedAndIndependentOfPullBoundaries() throws {

@@ -6,31 +6,34 @@ import CoreGraphics
 struct DesktopBackgroundRenderer {
     static func compose(source: CIImage, in rect: CGRect, configuration: StudioConfiguration, image: CGImage? = nil, preparedBackground: CIImage? = nil) -> CIImage {
         guard rect.width > 0, rect.height > 0 else { return CIImage(color: .black).cropped(to: rect) }
-        if let preparedBackground {
-            return fit(source, into: rect, fill: false).composited(over: preparedBackground).cropped(to: rect)
-        }
-        if configuration.backgroundStyle == .black {
-            return fit(source, into: rect, fill: false).composited(over: CIImage(color: .black).cropped(to: rect))
-        }
+        let background = preparedBackground ?? self.background(source: source, in: rect, configuration: configuration, image: image)
+        return fit(source, into: rect, fill: false).composited(over: background).cropped(to: rect)
+    }
+
+    /// Styles whose background ignores the captured pixels, so a renderer can bake it once.
+    static func isStatic(_ style: BackgroundStyle) -> Bool { style == .image || style == .mirror }
+
+    /// Everything behind the sharp foreground. `.blur` samples the live source; other styles
+    /// depend only on geometry, colour, and the chosen or mirrored wallpaper.
+    static func background(source: CIImage, in rect: CGRect, configuration: StudioConfiguration, image: CGImage?) -> CIImage {
+        if configuration.backgroundStyle == .black { return CIImage(color: .black).cropped(to: rect) }
         let rgb = CIColor(red: CGFloat(configuration.backgroundRed), green: CGFloat(configuration.backgroundGreen), blue: CGFloat(configuration.backgroundBlue), alpha: 1)
         let solid = CIImage(color: rgb).cropped(to: rect)
-        let background: CIImage
         switch configuration.backgroundStyle {
         case .black, .color:
-            background = solid
+            return solid
         case .image:
-            if let image { background = fit(CIImage(cgImage: image), into: rect, fill: true).composited(over: solid).cropped(to: rect) }
-            else { background = solid }
+            guard let image else { return solid }
+            return fit(CIImage(cgImage: image), into: rect, fill: true).composited(over: solid).cropped(to: rect)
         case .blur:
             let enlarged = fit(source, into: rect, fill: true).clampedToExtent()
             let blurred = enlarged.transformed(by: CGAffineTransform(scaleX: 0.25, y: 0.25))
                 .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: CGFloat(configuration.backgroundBlurRadius) * 0.25])
                 .transformed(by: CGAffineTransform(scaleX: 4, y: 4)).cropped(to: rect)
-            background = blurred.composited(over: solid).cropped(to: rect)
+            return blurred.composited(over: solid).cropped(to: rect)
         case .mirror:
-            background = mirrorBackground(source: source, in: rect, configuration: configuration, image: image)
+            return mirrorBackground(source: source, in: rect, configuration: configuration, image: image)
         }
-        return fit(source, into: rect, fill: false).composited(over: background).cropped(to: rect)
     }
 
     /// Builds the reflection recipe; FrameRenderer bakes and caches its output.

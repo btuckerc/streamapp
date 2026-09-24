@@ -50,7 +50,8 @@ struct StudioOnboarding: View {
             }
         }
         .frame(width: 520, height: 560)
-        .onAppear { model.refreshAuthorization() }
+        .onAppear { model.refreshAuthorization(); model.loadDevices() }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in model.refreshAuthorization() }
         .onDisappear { if model.rehearsalActive { model.stopRehearsal() } }
     }
 
@@ -76,17 +77,10 @@ struct StudioOnboarding: View {
 
     private var connect: some View {
         VStack(alignment: .leading, spacing: 18) {
-            intro("Connect your sources", "Nothing starts until you press a button. You can finish with a local-only setup.")
-            permissionRow("Screen Recording", detail: model.screenAuthorized ? "Ready to select a display or window" : "Optional — needed for desktop capture", icon: "rectangle.on.rectangle", ready: model.screenAuthorized) {
-                model.requestScreenPermission()
-            }
-            permissionRow("Camera", detail: model.cameraAuthorized ? "Ready" : "Optional — needed for webcam", icon: "video", ready: model.cameraAuthorized) {
-                model.requestPermission(.video)
-            }
-            permissionRow("Microphone", detail: model.microphoneAuthorized ? "Ready" : "Optional — needed for mic audio", icon: "mic", ready: model.microphoneAuthorized) {
-                model.requestPermission(.audio)
-            }
-            Button("Refresh status") { model.refreshAuthorization(); model.refreshSources() }.buttonStyle(.borderless)
+            intro("Connect your sources", "Nothing starts until you press a button. Every source is optional.")
+            permissionRow(.screen, detail: "For desktop capture and app audio", icon: "rectangle.on.rectangle")
+            permissionRow(.camera, detail: "For your webcam", icon: "video")
+            permissionRow(.microphone, detail: "For your voice", icon: "mic")
             if let message = model.message { Label(message, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange) }
         }
     }
@@ -101,20 +95,15 @@ struct StudioOnboarding: View {
             if model.configuration.layout == .desktopChat {
                 sourcePicker
             }
-            Toggle(isOn: $model.configuration.cameraEnabled) { Label("Camera", systemImage: "video") }
-                .disabled(!model.cameraAuthorized)
+            Toggle(isOn: model.enabledBinding(for: .camera)) { Label("Camera", systemImage: "video") }
             if model.configuration.cameraEnabled { devicePicker("Camera", devices: model.cameras) }
-            Toggle(isOn: $model.configuration.microphoneEnabled) { Label("Microphone", systemImage: "mic") }
-                .disabled(!model.microphoneAuthorized)
+            Toggle(isOn: model.enabledBinding(for: .microphone)) { Label("Microphone", systemImage: "mic") }
             if model.configuration.microphoneEnabled { devicePicker("Microphone", devices: model.microphones) }
-            Toggle(isOn: $model.configuration.systemAudioEnabled) { Label("System audio", systemImage: "speaker.wave.2") }
+            Toggle(isOn: model.enabledBinding(for: .screen)) { Label("System audio", systemImage: "speaker.wave.2") }
                 .disabled(engine.isRunning || model.busy)
             if model.configuration.systemAudioEnabled {
                 SystemAudioSourcePicker(model: model, engine: engine)
-                if !model.screenAuthorized {
-                    Text("Allow Screen Recording in Connect to capture system audio.")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
+                CaptureAccessNotice(model: model, permission: .screen)
             }
             ClickableDisclosure("Twitch account & chat (optional)") {
                 TwitchConnectionView(session: model.twitch, locked: model.demo || engine.isRunning || model.busy)
@@ -126,7 +115,7 @@ struct StudioOnboarding: View {
     private var sourcePicker: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack { Text("Screen source").font(.subheadline.weight(.medium)); Spacer(); Button("Refresh") { model.refreshSources() }.buttonStyle(.borderless) }
-            if model.sources.isEmpty { Text("No source selected. Refresh after granting Screen Recording, or use Just Chatting.").font(.caption).foregroundStyle(.secondary) }
+            if model.sources.isEmpty { Text("No source selected. Refresh after allowing Screen Recording, or use Just Chatting.").font(.caption).foregroundStyle(.secondary) }
             else { Picker("Source", selection: Binding(get: { model.configuration.windowID.map { "window:\($0)" } ?? model.configuration.displayID.map { "display:\($0)" } ?? "" }, set: { value in
                 guard let source = model.sources.first(where: { $0.stableID == value }) else { return }
                 model.configuration.displayID = source.kind == .display ? source.id : nil
@@ -147,7 +136,7 @@ struct StudioOnboarding: View {
             title == "Camera" ? model.configuration.cameraID : model.configuration.microphoneID
         }, set: { value in
             if title == "Camera" { model.configuration.cameraID = value } else { model.configuration.microphoneID = value }
-        })) { Text("Default device").tag(""); ForEach(devices) { Text($0.name).tag($0.id) } }.disabled(engine.isRunning || model.busy)
+        })) { Text("Automatic").tag(""); ForEach(devices) { Text($0.name).tag($0.id) } }.disabled(engine.isRunning || model.busy)
     }
 
 
@@ -188,8 +177,8 @@ struct StudioOnboarding: View {
             intro("Try it locally", "Rehearsal uses selected sources and records locally. It cannot broadcast.")
             Picker("Scene", selection: $model.configuration.layout) { ForEach(SceneLayout.allCases) { Text($0.title).tag($0) } }.pickerStyle(.segmented).disabled(model.busy)
             HStack {
-                Toggle(isOn: $model.configuration.cameraEnabled) { Label("Camera", systemImage: "video") }.disabled(!model.cameraAuthorized || model.busy)
-                Toggle(isOn: $model.configuration.microphoneEnabled) { Label("Microphone", systemImage: "mic") }.disabled(!model.microphoneAuthorized || model.busy)
+                Toggle(isOn: model.enabledBinding(for: .camera)) { Label("Camera", systemImage: "video") }.disabled(model.busy)
+                Toggle(isOn: model.enabledBinding(for: .microphone)) { Label("Microphone", systemImage: "mic") }.disabled(model.busy)
             }
             HStack {
                 Text(model.configuration.recordingDirectory).font(.caption).lineLimit(1)
@@ -222,7 +211,7 @@ struct StudioOnboarding: View {
                     DockFitControl(model: model, fit: model.dockFit, compact: true)
                 }
             }.toggleStyle(.switch)
-            HStack { meter("Mic", engine.microphoneLevel); meter("System", engine.systemLevel) }
+            SourceLevelMeters(meters: engine.meters)
             Text(model.rehearsalActive ? "LOCAL REC · Preview is live. Nothing is sent to Twitch." : "Preview records a local rehearsal using your selected sources. Nothing is sent to Twitch.")
                 .font(.caption).foregroundStyle(.secondary)
             if let message = model.message ?? engine.errorMessage {
@@ -246,8 +235,17 @@ struct StudioOnboarding: View {
     }
 
     private func intro(_ title: String, _ detail: String) -> some View { VStack(alignment: .leading, spacing: 5) { Text(title).font(.title3.weight(.semibold)); Text(detail).font(.callout).foregroundStyle(.secondary) } }
-    private func permissionRow(_ title: String, detail: String, icon: String, ready: Bool, action: @escaping () -> Void) -> some View {
-        HStack(spacing: 12) { Image(systemName: icon).frame(width: 24).foregroundStyle(.tint); VStack(alignment: .leading) { Text(title).font(.subheadline.weight(.medium)); Text(detail).font(.caption).foregroundStyle(.secondary) }; Spacer(); if ready { Image(systemName: "checkmark.circle.fill").foregroundStyle(.green) } else { Button("Allow…", action: action).buttonStyle(.bordered) } }
+    private func permissionRow(_ permission: CapturePermission, detail: String, icon: String) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon).frame(width: 24).foregroundStyle(.tint)
+            VStack(alignment: .leading) { Text(permission.title).font(.subheadline.weight(.medium)); Text(detail).font(.caption).foregroundStyle(.secondary) }
+            Spacer()
+            switch model.access(permission) {
+            case .allowed: Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+            case .notDetermined: Button("Allow…") { model.requestAccess(permission) }.buttonStyle(.bordered)
+            case .denied: Button("Open System Settings…") { model.openPrivacySettings(permission) }.buttonStyle(.bordered)
+            case .restricted: Text("Restricted").font(.caption).foregroundStyle(.secondary)
+            }
+        }
     }
-    private func meter(_ title: String, _ value: Float) -> some View { AudioLevelMeter(title: title, level: value) }
 }

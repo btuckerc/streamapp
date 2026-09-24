@@ -1,4 +1,5 @@
 import CoreImage
+import Metal
 import Testing
 @testable import StreamApp
 
@@ -76,5 +77,27 @@ struct DesktopBackgroundTests {
         let result = pixels(DesktopBackgroundRenderer.compose(source: source, in: canvas, configuration: c))
         let bar = (40 * 120 + 5) * 4
         #expect(Array(result[bar..<bar + 4]) == [0, 0, 255, 255])
+    }
+
+    @Test func residentLayerRendersLikeItsRecipe() throws {
+        // Production path: Metal context, linear working space, sRGB output, translucent
+        // content at a non-zero origin (chat over video, an offset desktop canvas).
+        let gpu = CIContext(mtlDevice: try #require(MTLCreateSystemDefaultDevice()), options: [.cacheIntermediates: false])
+        let srgb = try #require(CGColorSpace(name: CGColorSpace.sRGB))
+        let layer = CIImage(color: CIColor(red: 0.9, green: 0.2, blue: 0.4, alpha: 0.5)).cropped(to: CGRect(x: 10, y: 20, width: 60, height: 80))
+            .composited(over: CIImage(color: CIColor(red: 0.1, green: 0.6, blue: 0.3)).cropped(to: CGRect(x: 70, y: 20, width: 60, height: 80)))
+        let resident = FrameRenderer.resident(layer, in: canvas, context: gpu, colorSpace: srgb)
+        let backdrop = CIImage(color: CIColor(red: 0.2, green: 0.2, blue: 0.8)).cropped(to: canvas)
+        func render(_ image: CIImage) -> [UInt8] {
+            var bytes = [UInt8](repeating: 0, count: 120 * 80 * 4)
+            bytes.withUnsafeMutableBytes {
+                gpu.render(image.composited(over: backdrop), toBitmap: $0.baseAddress!, rowBytes: 120 * 4,
+                           bounds: canvas, format: .RGBA8, colorSpace: srgb)
+            }
+            return bytes
+        }
+        let expected = render(layer), actual = render(resident)
+        #expect(expected[(40 * 120 + 30) * 4] > 150)
+        #expect(zip(expected, actual).allSatisfy { abs(Int($0) - Int($1)) <= 1 })
     }
 }

@@ -3,11 +3,24 @@ import AVFoundation
 import Combine
 import ImageIO
 import Security
+import SwiftUI
 import UniformTypeIdentifiers
+
+enum CapturePermission: CaseIterable, Hashable {
+    case screen, camera, microphone
+    var title: String { switch self { case .screen: "Screen Recording"; case .camera: "Camera"; case .microphone: "Microphone" } }
+    var privacyPane: String { switch self { case .screen: "Privacy_ScreenCapture"; case .camera: "Privacy_Camera"; case .microphone: "Privacy_Microphone" } }
+    fileprivate var mediaType: AVMediaType? { switch self { case .screen: nil; case .camera: .video; case .microphone: .audio } }
+    fileprivate var configurationKey: WritableKeyPath<StudioConfiguration, Bool> {
+        switch self { case .screen: \.systemAudioEnabled; case .camera: \.cameraEnabled; case .microphone: \.microphoneEnabled }
+    }
+}
+
+enum CaptureAccess: Equatable { case notDetermined, allowed, denied, restricted }
 
 @MainActor
 final class StudioModel: ObservableObject {
-    enum SettingsTab: Hashable { case sources, audio, layout, teleprompter, drawing, outputs }
+    enum SettingsTab: Hashable { case sources, audio, layout, chat, teleprompter, drawing, outputs }
     @Published var settingsTab: SettingsTab = .sources
     @Published var settingsVisible = false
     let engine = StudioEngine()
@@ -17,6 +30,8 @@ final class StudioModel: ObservableObject {
     let dockFit = DockCanvasFit()
     @Published var configuration = StudioConfiguration() {
         didSet {
+            // Bindings often write back an unchanged value; don't save or reconfigure capture then.
+            guard configuration != oldValue else { return }
             if configuration.streamService != oldValue.streamService { message = nil }
             if (!configuration.cameraEnabled || configuration.layout != .desktopChat) && configuration.cameraPunchIn {
                 configuration.cameraPunchIn = false
@@ -42,9 +57,7 @@ final class StudioModel: ObservableObject {
     @Published var streamKey = ""
     @Published var keySaved = false
     @Published private(set) var rehearsalActive = false
-    @Published var screenAuthorized = CGPreflightScreenCaptureAccess()
-    @Published var cameraAuthorized = AVCaptureDevice.authorizationStatus(for: .video) == .authorized
-    @Published var microphoneAuthorized = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+    @Published private(set) var captureAccess = StudioModel.currentAccess()
     /// Stored independently from the Codable broadcast settings for safe schema evolution.
     @Published private(set) var onboardingCompleted: Bool
     let demo: Bool
@@ -52,13 +65,19 @@ final class StudioModel: ObservableObject {
     @Published private(set) var backgroundImageError: String?
     @Published private(set) var importingBackgroundImage = false
     private var backgroundImportGeneration = 0
-    var missingCapturePermissions: [String] {
+    func access(_ permission: CapturePermission) -> CaptureAccess { captureAccess[permission] ?? .notDetermined }
+    /// Permissions the current configuration needs but lacks.
+    var captureAccessIssues: [CapturePermission] {
         guard !demo else { return [] }
-        var missing: [String] = []
-        if !screenAuthorized { missing.append("Screen & system audio") }
-        if !cameraAuthorized { missing.append("Camera") }
-        if !microphoneAuthorized { missing.append("Microphone") }
-        return missing
+        let c = configuration
+        return CapturePermission.allCases.filter { permission in
+            let needed: Bool = switch permission {
+            case .screen: c.layout == .desktopChat || c.systemAudioEnabled
+            case .camera: c.cameraEnabled
+            case .microphone: c.microphoneEnabled
+            }
+            return needed && access(permission) != .allowed
+        }
     }
     var toggleAnnotations: (() -> Void)?
     var clearAnnotations: (() -> Void)?
@@ -80,9 +99,14 @@ final class StudioModel: ObservableObject {
     private var rehearsalStopTask: Task<Void, Never>?
     private var dockRegionSubscription: AnyCancellable?
     private var twitchSubscription: AnyCancellable?
+    private var deviceSubscription: AnyCancellable?
+    private var devicesLoaded = false
+    private var deviceGeneration = 0
     private var pendingUpdate = false
     private var loading = true
     private static let onboardingKey = "StreamApp.onboardingCompleted"
+    /// CGPreflight cannot distinguish "never asked" from "denied"; remember our first request.
+    private nonisolated static let screenRequestedKey = "StreamApp.screenCaptureRequested"
     private var persistenceURL: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("StreamApp/settings.json")
@@ -110,8 +134,14 @@ final class StudioModel: ObservableObject {
         refreshBackgroundImageState()
         teleprompter.configure(configuration)
         loading = false
-        // Device enumeration is non-capturing. Screen/window enumeration is explicit.
-        cameras = engine.cameras(); microphones = engine.microphones()
+        // Device enumeration is non-capturing and deferred to the views that list devices
+        // (loadDevices). Screen/window enumeration is explicit.
+        if !demo {
+            deviceSubscription = NotificationCenter.default.publisher(for: AVCaptureDevice.wasConnectedNotification)
+                .merge(with: NotificationCenter.default.publisher(for: AVCaptureDevice.wasDisconnectedNotification))
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in self?.refreshDevices() }
+        }
         twitchSubscription = twitch.$account.dropFirst().sink { [weak self] account in
             guard let self, account == nil, self.engine.isRunning,
                   self.configuration.streamingEnabled, self.configuration.streamService == .twitch else { return }
@@ -207,41 +237,122 @@ final class StudioModel: ObservableObject {
         }
     }
 
+    private nonisolated static func currentAccess() -> [CapturePermission: CaptureAccess] {
+        var result: [CapturePermission: CaptureAccess] = [:]
+        for permission in CapturePermission.allCases {
+            guard let media = permission.mediaType else {
+                result[permission] = CGPreflightScreenCaptureAccess() ? .allowed
+                    : UserDefaults.standard.bool(forKey: screenRequestedKey) ? .denied : .notDetermined
+                continue
+            }
+            result[permission] = switch AVCaptureDevice.authorizationStatus(for: media) {
+            case .authorized: .allowed
+            case .denied: .denied
+            case .restricted: .restricted
+            case .notDetermined: .notDetermined
+            @unknown default: .notDetermined
+            }
+        }
+        return result
+    }
+
     func refreshAuthorization() {
-        screenAuthorized = CGPreflightScreenCaptureAccess()
-        cameraAuthorized = AVCaptureDevice.authorizationStatus(for: .video) == .authorized
-        microphoneAuthorized = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+        let current = Self.currentAccess()
+        if current != captureAccess { captureAccess = current }
+    }
+
+    /// Only Settings and setup list devices; the first one shown enumerates them off the main thread.
+    func loadDevices() {
+        guard !devicesLoaded else { return }
+        devicesLoaded = true
+        refreshDevices()
+    }
+
+    private func refreshDevices() {
+        guard devicesLoaded else { return }
+        deviceGeneration &+= 1
+        let generation = deviceGeneration
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let cameras = StudioEngine.cameras(), microphones = StudioEngine.microphones()
+            await self?.applyDevices(cameras: cameras, microphones: microphones, generation: generation)
+        }
+    }
+
+    private func applyDevices(cameras: [DeviceOption], microphones: [DeviceOption], generation: Int) {
+        guard deviceGeneration == generation else { return }  // a newer refresh supersedes this one
+        if self.cameras != cameras { self.cameras = cameras }
+        if self.microphones != microphones { self.microphones = microphones }
     }
 
     func refreshSources() {
         refreshAuthorization()
-        cameras = engine.cameras(); microphones = engine.microphones()
-        guard screenAuthorized else { message = "Grant Screen Recording access before listing displays and windows."; return }
+        guard access(.screen) == .allowed else { message = "Screen Recording access is off."; return }
         Task {
             do { sources = try await engine.sources() }
             catch { message = error.localizedDescription }
         }
     }
 
-    func requestScreenPermission() {
-        // Only called from the user's explicit permission button, never on launch.
-        if !CGRequestScreenCaptureAccess() {
-            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
-        }
-        screenAuthorized = CGPreflightScreenCaptureAccess()
+    /// Source toggle that asks for access in context. Turning off never asks.
+    func enabledBinding(for permission: CapturePermission) -> Binding<Bool> {
+        let key = permission.configurationKey
+        return Binding(
+            get: { [weak self] in self?.configuration[keyPath: key] ?? false },
+            set: { [weak self] on in
+                guard let self else { return }
+                guard on, !demo else { configuration[keyPath: key] = on; return }
+                switch access(permission) {
+                case .allowed: configuration[keyPath: key] = true
+                case .notDetermined:
+                    Task { [weak self] in
+                        guard let self, await promptForAccess(permission) else { return }
+                        configuration[keyPath: key] = true
+                    }
+                case .denied, .restricted: presentAccessAlert(permission)
+                }
+            })
     }
 
-    func requestPermission(_ media: AVMediaType) {
-        Task {
-            let allowed = await AVCaptureDevice.requestAccess(for: media)
-            if media == .video { cameraAuthorized = allowed } else { microphoneAuthorized = allowed }
-            if !allowed {
-                message = "Access denied. Enable StreamApp in System Settings → Privacy & Security."
-                let pane = media == .video ? "Privacy_Camera" : "Privacy_Microphone"
-                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?\(pane)")!)
-            }
-            cameras = engine.cameras(); microphones = engine.microphones()
+    /// Explicit button: prompt once, afterwards send the user to the Privacy pane.
+    func requestAccess(_ permission: CapturePermission) {
+        switch access(permission) {
+        case .allowed: return
+        case .notDetermined: Task { _ = await promptForAccess(permission) }
+        case .denied, .restricted: openPrivacySettings(permission)
         }
+    }
+
+    func openPrivacySettings(_ permission: CapturePermission) {
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?\(permission.privacyPane)")!)
+    }
+
+    func showVideoEffects() { AVCaptureDevice.showSystemUserInterface(.videoEffects) }
+
+    /// Shows the system prompt. Never opens System Settings afterwards: a fresh "Don't Allow" must not be nagged.
+    private func promptForAccess(_ permission: CapturePermission) async -> Bool {
+        let allowed: Bool
+        if let media = permission.mediaType {
+            allowed = await AVCaptureDevice.requestAccess(for: media)
+        } else {
+            UserDefaults.standard.set(true, forKey: Self.screenRequestedKey)
+            allowed = CGRequestScreenCaptureAccess()
+        }
+        refreshAuthorization()
+        return allowed
+    }
+
+    private func presentAccessAlert(_ permission: CapturePermission) {
+        let alert = NSAlert()
+        alert.messageText = "\(permission.title) access is off"
+        if access(permission) == .restricted {
+            alert.informativeText = "\(permission.title) access is restricted on this Mac."
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
+        alert.informativeText = "Allow StreamApp in System Settings › Privacy & Security › \(permission.title)."
+        alert.addButton(withTitle: "Open System Settings"); alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn { openPrivacySettings(permission) }
     }
 
     func validateStreamSetup() -> Bool {
@@ -270,12 +381,8 @@ final class StudioModel: ObservableObject {
             if configuration.layout == .desktopChat && configuration.displayID == nil && configuration.windowID == nil {
                 message = "Choose a display or window first."; return
             }
-            if configuration.cameraEnabled && AVCaptureDevice.authorizationStatus(for: .video) != .authorized {
-                message = "Grant Camera access before enabling the webcam."; return
-            }
-            if configuration.microphoneEnabled && AVCaptureDevice.authorizationStatus(for: .audio) != .authorized {
-                message = "Grant Microphone access before enabling microphone audio."; return
-            }
+            if configuration.cameraEnabled && access(.camera) != .allowed { message = "Camera access is off."; return }
+            if configuration.microphoneEnabled && access(.microphone) != .allowed { message = "Microphone access is off."; return }
         }
         if configuration.streamingEnabled {
             let mode = configuration.twitchTestMode ? "Twitch bandwidth test (not viewable live)" : "live broadcast"

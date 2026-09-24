@@ -256,7 +256,7 @@ private struct TeleprompterPanelContent: View {
                 Text(error).font(.system(size: 16)).foregroundStyle(.white).lineLimit(2)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading).padding(.horizontal, 20)
             } else if model.pageCount == 0 {
-                Text("Choose a Markdown transcript in Teleprompter settings.")
+                Text("Choose a Markdown transcript in Settings → Prompter.")
                     .font(.system(size: 16)).foregroundStyle(.white.opacity(0.8))
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading).padding(.horizontal, 20)
             } else {
@@ -300,38 +300,38 @@ struct TeleprompterControls: View {
     }
     var body: some View {
         Form {
-            Section("Camera / notch teleprompter") {
+            Section("Notch teleprompter") {
                 Picker("Mode", selection: mode) {
                     ForEach(TeleprompterMode.allCases) { Text($0.title).tag($0) }
                 }.pickerStyle(.segmented).accessibilityLabel("Teleprompter mode")
-                Text("Three transcript lines or six chat messages, just below the display camera. Click the panel to collapse; use the chevron beside the notch to expand.")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .help("Shows below the display camera. Click the panel to collapse; the chevron beside the notch expands it.")
                 Toggle("Visible in stream and recording", isOn: $model.configuration.teleprompterInCapture)
                     .accessibilityLabel("Teleprompter visible in stream and recording")
-                Text(model.configuration.teleprompterInCapture
-                     ? "Visible in StreamApp display capture on the panel’s display. Full Camera and other single-window sources do not include it."
-                     : "Private in StreamApp, even with Show StreamApp windows enabled. This does not hide it from other recording apps.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            Section("Markdown transcript") {
-                Text(teleprompter.transcriptName.isEmpty ? "No transcript selected" : teleprompter.transcriptName)
-                    .font(.headline).lineLimit(1)
-                HStack {
-                    Button("Open Markdown…") { model.chooseTranscript() }
-                    Button("Reload") { model.reloadTranscript() }.disabled(model.configuration.transcriptPath.isEmpty)
-                    Button("Save Template…") { model.saveTranscriptTemplate() }
-                }
-                if let error = teleprompter.error { Text(error).font(.caption).foregroundStyle(.orange) }
-                pageControls
-                Text("Put --- on its own line between cues. Longer cues wrap into three-line pages. Left and Right arrows move between pages globally while expanded in Transcript mode; they are paused while editing StreamApp settings or choosing files.")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .help("Off keeps it out of StreamApp capture, even with Show StreamApp windows on. Other recording apps can still see it.")
             }
             if model.configuration.teleprompterMode == .twitchChat {
                 Section("Twitch chat") {
-                    Text(model.configuration.twitchChatChannel.isEmpty ? "Follows your connected Twitch account" : "Channel: \(model.configuration.twitchChatChannel)")
+                    LabeledContent("Channel", value: model.configuration.twitchChatChannel.isEmpty ? "Your account" : model.configuration.twitchChatChannel)
+                        .help("Set in Chat")
                     Text(teleprompter.chatStatus).font(.caption).foregroundStyle(.secondary)
-                    Text("Connect Twitch or choose a channel in Sources. This panel works independently of Render chat.")
-                        .font(.caption).foregroundStyle(.secondary)
+                }
+            } else {
+                Section("Transcript") {
+                    HStack {
+                        Text(teleprompter.transcriptName.isEmpty ? "No transcript" : teleprompter.transcriptName).lineLimit(1)
+                        Spacer()
+                        Button("Open…") { model.chooseTranscript() }
+                        Button("Reload") { model.reloadTranscript() }.disabled(model.configuration.transcriptPath.isEmpty)
+                        Button("Save Template…") { model.saveTranscriptTemplate() }
+                            .help("Markdown with --- on its own line between cues")
+                    }
+                    // An unset path already reads "No transcript"; only surface real load errors.
+                    if let error = teleprompter.error, !model.configuration.transcriptPath.isEmpty {
+                        Text(error).font(.caption).foregroundStyle(.orange)
+                    }
+                    if teleprompter.pageCount > 0 {
+                        pageControls.help("← and → change pages while the transcript is expanded")
+                    }
                 }
             }
         }.formStyle(.grouped)

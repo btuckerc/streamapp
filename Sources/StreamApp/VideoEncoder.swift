@@ -176,7 +176,14 @@ final class VideoEncoder: @unchecked Sendable {
         guard presentation.isNumeric else { fail(EncoderError.message("invalid encoded timestamp")); return }
         let pts = CMTimeConvertScale(presentation, timescale: 30, method: .roundHalfAwayFromZero).value
         let dts = decode.isNumeric ? CMTimeConvertScale(decode, timescale: 30, method: .roundHalfAwayFromZero).value : pts
-        let key = ((CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[CFString: Any]])?.first?[kCMSampleAttachmentKey_NotSync] as? Bool) != true
+        // Keyframe unless NotSync is true; direct CF lookup avoids bridging the attachment array per frame.
+        var key = true
+        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false),
+           CFArrayGetCount(attachments) > 0, let first = CFArrayGetValueAtIndex(attachments, 0),
+           let value = CFDictionaryGetValue(unsafeBitCast(first, to: CFDictionary.self),
+                                            Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque()) {
+            key = (Unmanaged<AnyObject>.fromOpaque(value).takeUnretainedValue() as? Bool) != true
+        }
         let result: Int32
         if let pointer, length == total {
             result = sa_mux_write(muxer, UnsafeRawPointer(pointer).assumingMemoryBound(to: UInt8.self),

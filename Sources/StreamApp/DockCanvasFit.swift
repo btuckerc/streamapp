@@ -160,7 +160,7 @@ final class DockCanvasFit: ObservableObject {
     private func refresh() async {
         guard !busy, let value = saved else { return }
         guard value.recovering != true else {
-            message = "Dock restoration is pending. Use Restore previous Dock settings to finish."
+            message = "Dock restoration is pending. Turn off Fit 16:9 to finish."
             return
         }
         guard let measured = measurement(value.displayID) else {
@@ -320,20 +320,11 @@ struct DockFitControl: View {
     @State private var error: String?
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Toggle("Fit 16:9", isOn: Binding(get: { fit.displayID != nil }, set: { enabled in
-                    if enabled { confirm = true } else { Task { await change(false) } }
-                }))
-                if !compact {
-                    Button { Task { await change(false) } } label: { Image(systemName: "arrow.counterclockwise") }
-                        .buttonStyle(.borderless)
-                        .help("Restore the previous Dock size and auto-hide setting")
-                        .accessibilityLabel("Restore previous Dock settings")
-                        .disabled(fit.displayID == nil || fit.busy)
-                }
-            }
+            Toggle("Fit 16:9", isOn: Binding(get: { fit.displayID != nil }, set: { enabled in
+                if enabled { confirm = true } else { Task { await change(false) } }
+            }))
             .disabled(model.busy || model.engine.isRunning || fit.busy || (fit.displayID == nil && model.configuration.windowID != nil))
-            .help("Temporarily shows and resizes the Dock to fit the desktop to the scene, accounting for chat. Briefly restarts Dock when applying or restoring settings; remembers its previous size and auto-hide setting.")
+            .help("Resizes the Dock so the desktop fits the scene. Turning it off restores your Dock.")
             if fit.busy { ProgressView("Adjusting Dock…").controlSize(.small) }
             if let text = error ?? (compact ? nil : fit.message) {
                 Text(text).font(.caption).foregroundStyle(error == nil ? Color.secondary : Color.orange)
@@ -343,7 +334,7 @@ struct DockFitControl: View {
             Button("Fit Dock") { Task { await change(true) } }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Fit temporarily shows and resizes the Dock, briefly restarting it to apply the desktop layout. Turning Fit off restores its previous size and auto-hide setting and waits for the desktop space to return. Handoff and Dock items stay untouched.")
+            Text("StreamApp briefly restarts the Dock to resize it. Turning Fit off restores its previous size and auto-hide setting.")
         }
     }
     private func change(_ enabled: Bool) async {

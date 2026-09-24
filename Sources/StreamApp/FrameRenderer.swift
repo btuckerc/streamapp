@@ -140,33 +140,47 @@ final class FrameRenderer: @unchecked Sendable {
     private var previewPool: CVPixelBufferPool?
     private var renderedGeneration: UInt64?
     private var transition = SceneTransition()
-    /// The wallpaper texture is baked once per source/geometry change.
-    private struct MirrorBackgroundKey: Equatable {
+    /// Static backgrounds (mirrored wallpaper, chosen image) are baked once per source/geometry
+    /// change into GPU memory, so recomposed frames neither re-upload nor re-scale them.
+    private struct BackgroundKey: Equatable {
+        let style: BackgroundStyle
         let imageID: ObjectIdentifier?
         let canvas: CGRect
         let sourceExtent: CGRect
-        let red: CGFloat
-        let green: CGFloat
-        let blue: CGFloat
+        let red: Double
+        let green: Double
+        let blue: Double
     }
-    private var mirrorBackgroundKey: MirrorBackgroundKey?
-    private var mirrorWallpaperImage: CGImage?
-    private var mirrorBackground: CIImage?
-    /// Webcam masks and shadows only change with scene geometry.
-    private var cameraSurfaceRect: CGRect?
-    private var cameraSurfaceRadius: CGFloat = -1
-    private var cameraSurfaceMask: CIImage?
-    private var cameraSurfaceShadow: CIImage?
+    private var backgroundKey: BackgroundKey?
+    /// Retained so `imageID` cannot be reused by a different image.
+    private var backgroundSourceImage: CGImage?
+    private var bakedBackground: CIImage?
+    /// The latest chat snapshot, uploaded once rather than on every composed frame.
+    private var chatSource: CGImage?
+    private var chatImage: CIImage?
+    private var chatPool: CVPixelBufferPool?
+    private var chatPoolSize = CGSize.zero
+    /// One camera-local geometry recipe, never a captured or composed frame.
+    private struct CameraSurfaceKey: Equatable {
+        let size: CGSize
+        let radius: CGFloat
+    }
+    private struct CameraSurface {
+        let key: CameraSurfaceKey
+        let mask: CIImage
+        let shadow: CIImage
+    }
+    private var cameraSurface: CameraSurface?
     private var renderedGeometry: SceneGeometry?
     private let extent = CGRect(x: 0, y: 0, width: 1920, height: 1080)
     private let color = CGColorSpace(name: CGColorSpace.sRGB)!
     private let black = CIImage(color: .black).cropped(to: CGRect(x: 0, y: 0, width: 1920, height: 1080))
-    private lazy var cameraOff = Self.slate("CAMERA OFF", subtitle: "Enable your webcam to appear here", width: 1920, height: 1080, color: (0.06, 0.07, 0.09))
-    private lazy var waiting = Self.slate("WAITING FOR SOURCE", subtitle: "No screen image is being substituted", width: 1920, height: 1080, color: (0.05, 0.08, 0.12))
-    private lazy var chatWaiting = Self.slate("CHAT", subtitle: "Connecting…", width: 384, height: 1080, color: (0, 0, 0), transparent: true)
-    private lazy var syntheticDesktop = Self.slate("SYNTHETIC DESKTOP", subtitle: "StreamApp · 1920 × 1080 · 30 fps", width: 1920, height: 1080, color: (0.03, 0.12, 0.22))
-    private lazy var syntheticFace = Self.slate("SYNTHETIC CAMERA", subtitle: "No camera device is open", width: 1920, height: 1080, color: (0.28, 0.12, 0.42), textured: true)
-    private lazy var syntheticChat = Self.slate("# CHAT", subtitle: "Crisp over blurred video", width: 384, height: 1080, color: (0, 0, 0), transparent: true)
+    private lazy var cameraOff = resident(Self.slate("CAMERA OFF", subtitle: "Enable your webcam to appear here", width: 1920, height: 1080, color: (0.06, 0.07, 0.09)))
+    private lazy var waiting = resident(Self.slate("WAITING FOR SOURCE", subtitle: "No screen image is being substituted", width: 1920, height: 1080, color: (0.05, 0.08, 0.12)))
+    private lazy var chatWaiting = resident(Self.slate("CHAT", subtitle: "Connecting…", width: 384, height: 1080, color: (0, 0, 0), transparent: true))
+    private lazy var syntheticDesktop = resident(Self.slate("SYNTHETIC DESKTOP", subtitle: "StreamApp · 1920 × 1080 · 30 fps", width: 1920, height: 1080, color: (0.03, 0.12, 0.22)))
+    private lazy var syntheticFace = resident(Self.slate("SYNTHETIC CAMERA", subtitle: "No camera device is open", width: 1920, height: 1080, color: (0.28, 0.12, 0.42), textured: true))
+    private lazy var syntheticChat = resident(Self.slate("# CHAT", subtitle: "Crisp over blurred video", width: 384, height: 1080, color: (0, 0, 0), transparent: true))
 
     init(inputs: RenderInputs, preview: PreviewFrames, outputFD: Int32?, synthetic: Bool) throws {
         guard let device = MTLCreateSystemDefaultDevice() else { throw EngineError.message("Metal is unavailable") }
@@ -212,7 +226,8 @@ final class FrameRenderer: @unchecked Sendable {
             if encoder != nil && now - startedAt! - Double(frame) / 30 >= 0.2 {
                 throw EngineError.message("Video timing fell behind; stopping to preserve audio synchronization")
             }
-            let geometry = transition.sample(target: SceneGeometry(configuration: snapshot.configuration), now: now, reduceMotion: snapshot.reduceMotion)
+            let target = SceneGeometry(configuration: snapshot.configuration)
+            let geometry = transition.sample(target: target, now: now, reduceMotion: snapshot.reduceMotion)
             if synthetic || composite == nil || renderedGeneration != snapshot.generation || renderedGeometry != geometry {
                 let buffer: CVPixelBuffer
                 if let encoder { buffer = try encoder.makePixelBuffer() }
@@ -220,7 +235,7 @@ final class FrameRenderer: @unchecked Sendable {
                     guard let available = try makePreviewBuffer() else { return }
                     buffer = available
                 }
-                context.render(compose(snapshot, geometry: geometry), to: buffer, bounds: extent, colorSpace: color)
+                context.render(compose(snapshot, geometry: geometry, settled: geometry == target), to: buffer, bounds: extent, colorSpace: color)
                 composite = buffer
                 renderedGeneration = snapshot.generation
                 renderedGeometry = geometry
@@ -236,7 +251,7 @@ final class FrameRenderer: @unchecked Sendable {
             }
         } catch { inputs.fail("Video pipeline: \(error)") }
     }
-    private func compose(_ snapshot: RenderInputs.Snapshot, geometry g: SceneGeometry) -> CIImage {
+    private func compose(_ snapshot: RenderInputs.Snapshot, geometry g: SceneGeometry, settled: Bool) -> CIImage {
         let c = snapshot.configuration
         var camera = c.cameraEnabled ? (synthetic ? syntheticFace : snapshot.camera.map { CIImage(cvPixelBuffer: $0) }) : nil
         if let image = camera, c.mirrorCamera {
@@ -248,58 +263,47 @@ final class FrameRenderer: @unchecked Sendable {
             desktop = marker.composited(over: desktop)
         }
         var preparedBackground: CIImage?
-        if c.backgroundStyle == .mirror {
-            let key = MirrorBackgroundKey(imageID: snapshot.backgroundImage.map { ObjectIdentifier($0) }, canvas: g.desktop, sourceExtent: desktop.extent, red: CGFloat(c.backgroundRed), green: CGFloat(c.backgroundGreen), blue: CGFloat(c.backgroundBlue))
-            if key != mirrorBackgroundKey {
-                mirrorBackgroundKey = key
-                let recipe = DesktopBackgroundRenderer.mirrorBackground(source: desktop, in: g.desktop, configuration: c, image: snapshot.backgroundImage)
-                mirrorWallpaperImage = snapshot.backgroundImage
-                mirrorBackground = context.createCGImage(recipe, from: g.desktop, format: .RGBA8, colorSpace: color, deferred: false)
-                    .map { CIImage(cgImage: $0).transformed(by: CGAffineTransform(translationX: g.desktop.minX, y: g.desktop.minY)) }
+        if DesktopBackgroundRenderer.isStatic(c.backgroundStyle) {
+            // Mid-transition the canvas moves every frame; draw the recipe directly then.
+            if settled {
+                let key = BackgroundKey(style: c.backgroundStyle, imageID: snapshot.backgroundImage.map { ObjectIdentifier($0) }, canvas: g.desktop, sourceExtent: desktop.extent, red: c.backgroundRed, green: c.backgroundGreen, blue: c.backgroundBlue)
+                if key != backgroundKey {
+                    backgroundKey = key
+                    backgroundSourceImage = snapshot.backgroundImage
+                    bakedBackground = Self.resident(DesktopBackgroundRenderer.background(source: desktop, in: g.desktop, configuration: c, image: snapshot.backgroundImage),
+                                                    in: g.desktop, context: context, colorSpace: color)
+                }
+                preparedBackground = bakedBackground
             }
-            preparedBackground = mirrorBackground
         } else {
-            mirrorBackgroundKey = nil
-            mirrorWallpaperImage = nil
-            mirrorBackground = nil
+            backgroundKey = nil
+            backgroundSourceImage = nil
+            bakedBackground = nil
         }
         var image = DesktopBackgroundRenderer.compose(source: desktop, in: g.desktop, configuration: c, image: snapshot.backgroundImage, preparedBackground: preparedBackground)
         if let camera, g.overlay >= 1 {
             image = fit(camera, into: g.camera, fill: true).composited(over: image)
         } else if let camera {
-            let radius = min(g.camera.width, g.camera.height) * 0.08 * (1 - g.overlay)
-            if cameraSurfaceRect != g.camera || abs(cameraSurfaceRadius - radius) > 0.01 {
-                cameraSurfaceRect = g.camera
-                cameraSurfaceRadius = radius
-                let mask = CIFilter(name: "CIRoundedRectangleGenerator", parameters: [
-                    "inputExtent": CIVector(cgRect: g.camera), "inputRadius": radius, "inputColor": CIColor.white
-                ])!.outputImage!
-                cameraSurfaceMask = mask
-                // Keep the shadow deliberately quiet: separation, not a frame.
-                cameraSurfaceShadow = mask
-                    .applyingFilter("CIColorMatrix", parameters: [
-                        "inputRVector": CIVector(x: 0, y: 0, z: 0, w: 0),
-                        "inputGVector": CIVector(x: 0, y: 0, z: 0, w: 0),
-                        "inputBVector": CIVector(x: 0, y: 0, z: 0, w: 0)
-                    ])
-                    .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: 12])
-                    .transformed(by: CGAffineTransform(translationX: 0, y: -2))
-                    .cropped(to: g.camera.insetBy(dx: -38, dy: -38))
-            }
-            let surface = fit(camera, into: g.camera, fill: true)
+            let strength = max(0, min(1, 1 - g.overlay))
+            let shortSide = min(g.camera.width, g.camera.height)
+            let radius = (c.cameraFrame == .circle ? shortSide / 2 : shortSide * 0.08) * strength
+            let geometry = cameraSurfaceGeometry(size: g.camera.size, radius: radius)
+            let placement = CGAffineTransform(translationX: g.camera.midX, y: g.camera.midY)
+            let shadow = opacity(geometry.shadow, 0.18 * strength).transformed(by: placement)
+            image = shadow.composited(over: image)
             let transparent = CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 0)).cropped(to: g.camera)
-            let rounded = surface.applyingFilter("CIBlendWithAlphaMask", parameters: [
-                kCIInputBackgroundImageKey: transparent,
-                kCIInputMaskImageKey: cameraSurfaceMask!
-            ])
-            let shadow = opacity(cameraSurfaceShadow!, 0.22 * (1 - g.overlay))
-            image = rounded.composited(over: shadow.composited(over: image))
+            let rounded = fit(camera, into: g.camera, fill: true)
+                .applyingFilter("CIBlendWithAlphaMask", parameters: [
+                    kCIInputBackgroundImageKey: transparent,
+                    kCIInputMaskImageKey: geometry.mask.transformed(by: placement)
+                ])
+            image = rounded.composited(over: image)
         } else if g.overlay > 0 {
             // No cached face or face-shaped intermediate survives camera-off.
             image = opacity(cameraOff, g.overlay).composited(over: image)
         }
         guard c.chatEnabled, g.chat.width > 0 else { return image.cropped(to: extent) }
-        let chat = synthetic ? syntheticChat : snapshot.chat.map { CIImage(cgImage: $0) } ?? chatWaiting
+        let chat = synthetic ? syntheticChat : snapshot.chat.map(residentChat) ?? chatWaiting
         let opaquePanel = CIImage(color: CIColor(red: 0.07, green: 0.09, blue: 0.13)).cropped(to: g.chat)
         var panel = opaquePanel
         if g.overlay > 0 {
@@ -309,6 +313,29 @@ final class FrameRenderer: @unchecked Sendable {
         }
         image = panel.composited(over: image)
         return fit(chat, into: g.chat, fill: false).composited(over: image).cropped(to: extent)
+    }
+    private func cameraSurfaceGeometry(size: CGSize, radius: CGFloat) -> CameraSurface {
+        let key = CameraSurfaceKey(size: size, radius: radius)
+        if let cameraSurface, cameraSurface.key == key { return cameraSurface }
+        let aperture = CGRect(x: -size.width / 2, y: -size.height / 2, width: size.width, height: size.height)
+        let shadowBounds = aperture.insetBy(dx: -38, dy: -38)
+        let clear = CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 0)).cropped(to: shadowBounds)
+        let mask = CIFilter(name: "CIRoundedRectangleGenerator", parameters: [
+            "inputExtent": CIVector(cgRect: aperture),
+            kCIInputRadiusKey: radius,
+            "inputColor": CIColor.white
+        ])!.outputImage!.composited(over: clear).cropped(to: shadowBounds)
+        let shadow = mask.applyingFilter("CIColorMatrix", parameters: [
+            "inputRVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+            "inputGVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+            "inputBVector": CIVector(x: 0, y: 0, z: 0, w: 0)
+        ])
+            .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: 12])
+            .transformed(by: CGAffineTransform(translationX: 0, y: -2))
+            .cropped(to: shadowBounds)
+        let surface = CameraSurface(key: key, mask: mask, shadow: shadow)
+        cameraSurface = surface
+        return surface
     }
     private func opacity(_ image: CIImage, _ value: CGFloat) -> CIImage {
         image.applyingFilter("CIColorMatrix", parameters: ["inputAVector": CIVector(x: 0, y: 0, z: 0, w: value)])
@@ -328,6 +355,44 @@ final class FrameRenderer: @unchecked Sendable {
         let normalized = image.transformed(by: CGAffineTransform(translationX: -image.extent.minX, y: -image.extent.minY))
         return normalized.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
             .transformed(by: CGAffineTransform(translationX: rect.minX + (rect.width - image.extent.width * scale) / 2, y: rect.minY + (rect.height - image.extent.height * scale) / 2)).cropped(to: rect)
+    }
+    private func resident(_ image: CIImage) -> CIImage {
+        Self.resident(image, in: image.extent, context: context, colorSpace: color)
+    }
+    private func residentChat(_ source: CGImage) -> CIImage {
+        if let chatImage, chatSource === source { return chatImage }
+        let size = CGSize(width: source.width, height: source.height)
+        if chatPool == nil || chatPoolSize != size {
+            var attributes = Self.residentAttributes
+            attributes[kCVPixelBufferWidthKey as String] = source.width
+            attributes[kCVPixelBufferHeightKey as String] = source.height
+            attributes[kCVPixelBufferPixelFormatTypeKey as String] = kCVPixelFormatType_32BGRA
+            chatPool = nil
+            CVPixelBufferPoolCreate(nil, nil, attributes as CFDictionary, &chatPool)
+            chatPoolSize = size
+        }
+        let image = Self.resident(CIImage(cgImage: source), in: CGRect(origin: .zero, size: size), context: context, colorSpace: color, pool: chatPool)
+        chatSource = source; chatImage = image
+        return image
+    }
+    private static let residentAttributes: [String: Any] = [
+        kCVPixelBufferMetalCompatibilityKey as String: true,
+        kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any]()
+    ]
+    /// Renders a static layer once into an IOSurface so later frames sample GPU memory instead of
+    /// re-uploading a CPU bitmap (about 1 ms of CPU per 1080p layer per frame). Falls back to the
+    /// recipe itself if a buffer cannot be allocated.
+    static func resident(_ image: CIImage, in rect: CGRect, context: CIContext, colorSpace: CGColorSpace, pool: CVPixelBufferPool? = nil) -> CIImage {
+        let bounds = rect.integral
+        guard bounds.width > 0, bounds.height > 0 else { return image }
+        var buffer: CVPixelBuffer?
+        if let pool { CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer) }
+        else { CVPixelBufferCreate(nil, Int(bounds.width), Int(bounds.height), kCVPixelFormatType_32BGRA, residentAttributes as CFDictionary, &buffer) }
+        guard let buffer else { return image }
+        let toOrigin = CGAffineTransform(translationX: -bounds.minX, y: -bounds.minY)
+        context.render(image.transformed(by: toOrigin), to: buffer, bounds: CGRect(origin: .zero, size: bounds.size), colorSpace: colorSpace)
+        return CIImage(cvPixelBuffer: buffer, options: [.colorSpace: colorSpace])
+            .transformed(by: CGAffineTransform(translationX: bounds.minX, y: bounds.minY))
     }
     private static func slate(_ title: String, subtitle: String, width: Int, height: Int, color: (CGFloat, CGFloat, CGFloat), transparent: Bool = false, textured: Bool = false) -> CIImage {
         let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!

@@ -1,58 +1,88 @@
 #include "EncodedMuxer.h"
 #include <errno.h>
-#include <limits.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <string.h>
 #include <poll.h>
-#include <libavutil/time.h>
-#include <libavformat/avformat.h>
-#include <libavcodec/avcodec.h>
-#include <libavutil/error.h>
-#include <libavutil/mem.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/uio.h>
+#include <time.h>
+#include <unistd.h>
+
+// Writes the FLV subset StreamApp's FFmpeg child reads: one H.264 video stream
+// (FLV codec 7), onMetaData without duration/filesize (the fd is a pipe), an AVC
+// sequence header, AVC NALU tags with millisecond timestamps, and an end tag.
+// Byte layout matches libavformat's flv muxer for this configuration.
+
+enum { TAG_VIDEO = 9, TAG_META = 18, AVC = 7, FRAME_KEY = 1 << 4, FRAME_INTER = 2 << 4 };
+static const uint64_t stall_limit_ns = 2000000000ull;
 
 struct SAMuxer {
-    AVFormatContext *format;
-    AVIOContext *io;
-    AVRational input_time_base;
     int fd;
-    int header_written;
+    int fps;
+    int started;
+    int64_t offset_ms;  // shifts a negative first DTS to zero, as libavformat does
+    int64_t last_dts_ms;
+    uint32_t last_ts;
 };
 
 static int report(int code, char *error, size_t size) {
-    if (error && size) av_strerror(code, error, size);
+    if (error && size && strerror_r(-code, error, size) != 0)
+        snprintf(error, size, "Error number %d occurred", code);
     return code;
 }
 
-static int write_bytes(void *opaque, const uint8_t *buffer, int size) {
-    SAMuxer *muxer = opaque;
-    int offset = 0;
-    const int64_t deadline = av_gettime_relative() + 2000000;
-    while (offset < size) {
-        ssize_t count = write(muxer->fd, buffer + offset, (size_t)(size - offset));
-        if (count < 0 && errno == EINTR) continue;
-        if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            if (av_gettime_relative() >= deadline) return AVERROR(ETIMEDOUT);
-            struct pollfd descriptor = { .fd = muxer->fd, .events = POLLOUT };
-            int ready = poll(&descriptor, 1, 20);
-            if (ready < 0 && errno != EINTR) return AVERROR(errno);
-            continue;
-        }
-        if (count <= 0) return AVERROR(count < 0 ? errno : EIO);
-        offset += (int)count;
-    }
-    return size;
+static uint8_t *wb16(uint8_t *p, uint32_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; return p + 2; }
+static uint8_t *wb24(uint8_t *p, uint32_t v) { p[0] = (uint8_t)(v >> 16); return wb16(p + 1, v); }
+static uint8_t *wb32(uint8_t *p, uint32_t v) { p[0] = (uint8_t)(v >> 24); return wb24(p + 1, v); }
+static uint8_t *timestamp(uint8_t *p, uint32_t ts) { p = wb24(p, ts & 0xffffff); *p++ = (ts >> 24) & 0x7f; return p; }
+static uint8_t *amf_string(uint8_t *p, const char *s) {
+    size_t n = strlen(s);
+    p = wb16(p, (uint32_t)n);
+    memcpy(p, s, n);
+    return p + n;
+}
+static uint8_t *amf_number(uint8_t *p, const char *key, double value) {
+    uint64_t bits;
+    memcpy(&bits, &value, sizeof bits);
+    p = amf_string(p, key);
+    *p++ = 0;  // AMF number
+    p = wb32(p, (uint32_t)(bits >> 32));
+    return wb32(p, (uint32_t)bits);
+}
+// Tag header for a tag whose body ends at `end`; returns the trailing previous-tag-size.
+static uint8_t *close_tag(uint8_t *tag, uint8_t *end) {
+    uint32_t body = (uint32_t)(end - tag - 11);
+    wb24(tag + 1, body);
+    return wb32(end, body + 11);
 }
 
-static void release(SAMuxer *muxer) {
-    if (!muxer) return;
-    if (muxer->format) muxer->format->pb = NULL;
-    if (muxer->io) {
-        av_freep(&muxer->io->buffer);
-        avio_context_free(&muxer->io);
+// Retries short/non-blocking writes; fails after two seconds without progress.
+static int write_all(int fd, struct iovec *iov, int count) {
+    uint64_t deadline = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + stall_limit_ns;
+    while (count > 0) {
+        ssize_t written = writev(fd, iov, count);
+        if (written < 0 && errno == EINTR) continue;
+        if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) >= deadline) return -ETIMEDOUT;
+            struct pollfd descriptor = { .fd = fd, .events = POLLOUT };
+            if (poll(&descriptor, 1, 20) < 0 && errno != EINTR) return -errno;
+            continue;
+        }
+        if (written <= 0) return written < 0 ? -errno : -EIO;
+        deadline = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + stall_limit_ns;
+        size_t remaining = (size_t)written;
+        while (count > 0 && remaining >= iov->iov_len) { remaining -= iov->iov_len; iov++; count--; }
+        if (count > 0) { iov->iov_base = (uint8_t *)iov->iov_base + remaining; iov->iov_len -= remaining; }
     }
-    avformat_free_context(muxer->format);
-    av_free(muxer);
+    return 0;
+}
+
+// av_rescale_q(value, 1/fps, 1/1000) with round-half-away-from-zero.
+static int64_t milliseconds(int64_t value, int fps) {
+    int64_t scaled = value < 0 ? -value : value;
+    scaled = (scaled * 1000 + fps / 2) / fps;
+    return value < 0 ? -scaled : scaled;
 }
 
 int sa_mux_open(SAMuxer **result, const uint8_t *sps, size_t sps_size,
@@ -61,77 +91,75 @@ int sa_mux_open(SAMuxer **result, const uint8_t *sps, size_t sps_size,
     if (!result || !sps || !pps || sps_size < 4 || !pps_size ||
         sps_size > UINT16_MAX || pps_size > UINT16_MAX || width <= 0 ||
         height <= 0 || fps <= 0 || fd < 0)
-        return report(AVERROR(EINVAL), error, error_size);
+        return report(-EINVAL, error, error_size);
     *result = NULL;
-    SAMuxer *muxer = av_mallocz(sizeof(*muxer));
-    if (!muxer) return report(AVERROR(ENOMEM), error, error_size);
+    SAMuxer *muxer = calloc(1, sizeof(*muxer));
+    uint8_t *header = malloc(256 + sps_size + pps_size);
+    if (!muxer || !header) { free(muxer); free(header); return report(-ENOMEM, error, error_size); }
     muxer->fd = fd;
-    muxer->input_time_base = (AVRational){1, fps};
-    int status = avformat_alloc_output_context2(&muxer->format, NULL, "flv", NULL);
-    if (status < 0) goto failed;
-    uint8_t *buffer = av_malloc(32768);
-    if (!buffer) { status = AVERROR(ENOMEM); goto failed; }
-    muxer->io = avio_alloc_context(buffer, 32768, 1, muxer, NULL, write_bytes, NULL);
-    if (!muxer->io) { av_free(buffer); status = AVERROR(ENOMEM); goto failed; }
-    muxer->format->pb = muxer->io;
-    muxer->format->flags |= AVFMT_FLAG_CUSTOM_IO | AVFMT_FLAG_FLUSH_PACKETS;
-    AVStream *stream = avformat_new_stream(muxer->format, NULL);
-    if (!stream) { status = AVERROR(ENOMEM); goto failed; }
-    stream->time_base = muxer->input_time_base;
-    stream->avg_frame_rate = (AVRational){fps, 1};
-    AVCodecParameters *parameters = stream->codecpar;
-    parameters->codec_type = AVMEDIA_TYPE_VIDEO;
-    parameters->codec_id = AV_CODEC_ID_H264;
-    parameters->width = width;
-    parameters->height = height;
-    parameters->bit_rate = 6000000;
-    parameters->extradata_size = (int)(11 + sps_size + pps_size);
-    parameters->extradata = av_mallocz((size_t)parameters->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
-    if (!parameters->extradata) { status = AVERROR(ENOMEM); goto failed; }
-    uint8_t *out = parameters->extradata;
-    *out++ = 1; *out++ = sps[1]; *out++ = sps[2]; *out++ = sps[3];
-    *out++ = 0xff; *out++ = 0xe1;
-    *out++ = (uint8_t)(sps_size >> 8); *out++ = (uint8_t)sps_size;
-    memcpy(out, sps, sps_size); out += sps_size;
-    *out++ = 1;
-    *out++ = (uint8_t)(pps_size >> 8); *out++ = (uint8_t)pps_size;
-    memcpy(out, pps, pps_size);
-    AVDictionary *options = NULL;
-    // A pipe cannot seek back to rewrite duration/filesize; omit those fields.
-    av_dict_set(&options, "flvflags", "no_duration_filesize", 0);
-    status = avformat_write_header(muxer->format, &options);
-    av_dict_free(&options);
-    if (status < 0) goto failed;
-    muxer->header_written = 1;
-    avio_flush(muxer->io);
-    if (muxer->io->error < 0) { status = muxer->io->error; goto failed; }
+    muxer->fps = fps;
+    muxer->last_ts = UINT32_MAX;
+
+    uint8_t *p = header;
+    memcpy(p, "FLV\x01\x01", 5); p += 5;  // version 1, video only
+    p = wb32(p, 9);
+    p = wb32(p, 0);
+
+    uint8_t *tag = p;
+    *p++ = TAG_META; p += 3; p = timestamp(p, 0); p = wb24(p, 0);
+    *p++ = 2; p = amf_string(p, "onMetaData");
+    *p++ = 8; p = wb32(p, 5);  // ECMA array of five entries
+    p = amf_number(p, "width", width);
+    p = amf_number(p, "height", height);
+    p = amf_number(p, "videodatarate", 6000000 / 1024.0);
+    p = amf_number(p, "framerate", fps);
+    p = amf_number(p, "videocodecid", AVC);
+    p = amf_string(p, ""); *p++ = 9;  // object end
+    p = close_tag(tag, p);
+
+    tag = p;
+    *p++ = TAG_VIDEO; p += 3; p = timestamp(p, 0); p = wb24(p, 0);
+    *p++ = FRAME_KEY | AVC; *p++ = 0; p = wb24(p, 0);  // AVC sequence header
+    *p++ = 1; *p++ = sps[1]; *p++ = sps[2]; *p++ = sps[3];
+    *p++ = 0xff; *p++ = 0xe1;  // four-byte NAL lengths, one SPS
+    p = wb16(p, (uint32_t)sps_size); memcpy(p, sps, sps_size); p += sps_size;
+    *p++ = 1;
+    p = wb16(p, (uint32_t)pps_size); memcpy(p, pps, pps_size); p += pps_size;
+    p = close_tag(tag, p);
+
+    struct iovec iov = { header, (size_t)(p - header) };
+    int status = write_all(fd, &iov, 1);
+    free(header);
+    if (status < 0) { free(muxer); return report(status, error, error_size); }
     *result = muxer;
     return 0;
-failed:
-    release(muxer);
-    return report(status, error, error_size);
 }
 
 int sa_mux_write(SAMuxer *muxer, const uint8_t *data, size_t size,
                  int64_t pts, int64_t dts, int keyframe,
                  char *error, size_t error_size) {
-    if (!muxer || !data || !size || size > INT_MAX)
-        return report(AVERROR(EINVAL), error, error_size);
-    AVStream *stream = muxer->format->streams[0];
-    // av_write_frame retains caller ownership. The compressed sample stays alive
-    // throughout this synchronous call; raw image memory is never accessed here.
-    AVPacket packet = {0};
-    packet.data = (uint8_t *)data;
-    packet.size = (int)size;
-    packet.pts = av_rescale_q(pts, muxer->input_time_base, stream->time_base);
-    packet.dts = av_rescale_q(dts, muxer->input_time_base, stream->time_base);
-    packet.duration = av_rescale_q(1, muxer->input_time_base, stream->time_base);
-    packet.stream_index = stream->index;
-    packet.pos = -1;
-    if (keyframe) packet.flags |= AV_PKT_FLAG_KEY;
-    int status = av_write_frame(muxer->format, &packet);
-    avio_flush(muxer->io);
-    if (status >= 0 && muxer->io->error < 0) status = muxer->io->error;
+    // FLV stores 24-bit tag sizes; five bytes precede the payload.
+    if (!muxer || !data || !size || size + 5 >= 1u << 24 ||
+        pts > INT64_MAX / 1000 || pts < -INT64_MAX / 1000 ||
+        dts > INT64_MAX / 1000 || dts < -INT64_MAX / 1000)
+        return report(-EINVAL, error, error_size);
+    int64_t pts_ms = milliseconds(pts, muxer->fps), dts_ms = milliseconds(dts, muxer->fps);
+    if (!muxer->started && dts_ms < 0) muxer->offset_ms = -dts_ms;
+    if ((muxer->started && dts_ms < muxer->last_dts_ms) || pts_ms < dts_ms)
+        return report(-EINVAL, error, error_size);
+    muxer->started = 1;
+    muxer->last_dts_ms = dts_ms;
+    uint32_t ts = (uint32_t)(dts_ms + muxer->offset_ms);
+    muxer->last_ts = ts;
+
+    uint8_t header[16], trailer[4], *p = header;
+    *p++ = TAG_VIDEO; p = wb24(p, (uint32_t)size + 5); p = timestamp(p, ts); p = wb24(p, 0);
+    *p++ = (keyframe ? FRAME_KEY : FRAME_INTER) | AVC; *p++ = 1;  // AVC NALU
+    wb24(p, (uint32_t)(pts_ms - dts_ms));
+    wb32(trailer, (uint32_t)size + 16);
+    // The compressed sample stays alive throughout this synchronous call.
+    struct iovec iov[3] = { { header, sizeof header }, { (void *)data, size }, { trailer, sizeof trailer } };
+    int status = write_all(muxer->fd, iov, 3);
     return status < 0 ? report(status, error, error_size) : 0;
 }
 
@@ -139,11 +167,12 @@ int sa_mux_close(SAMuxer **reference, char *error, size_t error_size) {
     if (!reference || !*reference) return 0;
     SAMuxer *muxer = *reference;
     *reference = NULL;
-    int status = muxer->header_written ? av_write_trailer(muxer->format) : 0;
-    if (muxer->io) {
-        avio_flush(muxer->io);
-        if (status >= 0 && muxer->io->error < 0) status = muxer->io->error;
-    }
-    release(muxer);
+    uint8_t tag[20], *p = tag;
+    *p++ = TAG_VIDEO; p = wb24(p, 5); p = timestamp(p, muxer->last_ts); p = wb24(p, 0);
+    *p++ = FRAME_KEY | AVC; *p++ = 2; p = wb24(p, 0);  // AVC end of sequence
+    wb32(p, 16);
+    struct iovec iov = { tag, sizeof tag };
+    int status = write_all(muxer->fd, &iov, 1);
+    free(muxer);
     return status < 0 ? report(status, error, error_size) : 0;
 }

@@ -18,15 +18,21 @@ final class MediaOutput {
     private var writer: Task<Void, Never>?
     private var previewWriter: Task<Void, Never>?
     private var microphone: MicrophoneCapture?
+    private var microphoneID: String?
     private var synthetic = false
     private var active = false
     private var previewActive = false
     private var stopping = false
     private(set) var recordingURL: URL?
     var videoFD: Int32 { videoHandle?.fileDescriptor ?? -1 }
-    var levels: (microphone: Float, system: Float, output: Float, gainReduction: Float) { mixer.levels }
+    var levels: AudioMixer.Levels { mixer.levels }
     var status: String { state.status }
     var errorMessage: String? { state.error }
+    var echoReferenceCaptureFailure: String?
+    var echoCancellationStatus: String? {
+        guard let status = mixer.echoCancellationStatus else { return nil }
+        return echoReferenceCaptureFailure ?? status
+    }
     struct Health: Sendable {
         let frames: Int64
         let mediaSeconds: Double
@@ -107,6 +113,7 @@ final class MediaOutput {
         previewActive = false
         previewWriter?.cancel(); await previewWriter?.value; previewWriter = nil
         if let microphone { await microphone.stop(); self.microphone = nil }
+        mixer.reset(configuration: StudioConfiguration(), synthetic: false)
     }
 
 
@@ -137,9 +144,9 @@ final class MediaOutput {
                 let folder = URL(fileURLWithPath: configuration.recordingDirectory, isDirectory: true)
                 try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
                 let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
-                let url = folder.appendingPathComponent("StreamApp-\(stamp)-\(UUID().uuidString.prefix(8)).mkv")
+                let url = folder.appendingPathComponent("StreamApp-\(stamp)-\(UUID().uuidString.prefix(8)).\(configuration.recordingFormat.fileExtension)")
                 guard !FileManager.default.fileExists(atPath: url.path) else { throw OutputError.message("Recording already exists") }
-                recordingURL = url; outputs.append("[f=matroska]" + Self.teeEscape(url.path))
+                recordingURL = url; outputs.append("[\(configuration.recordingFormat.teeOptions)]" + Self.teeEscape(url.path))
             }
             if let target {
                 let tls = target.hasPrefix("rtmps://") ? ":format_opts=tls_verify=1\\\\:ca_file=/etc/ssl/cert.pem" : ""
@@ -211,13 +218,21 @@ final class MediaOutput {
     func updateAudio(configuration: StudioConfiguration) async throws {
         guard active else { return }
         if !synthetic {
+            if let microphone, !configuration.microphoneEnabled || microphoneID != configuration.microphoneID {
+                await microphone.stop(); self.microphone = nil; microphoneID = nil
+            }
+            // Invalidate queued samples before opening a different device.
+            mixer.configure(configuration)
             if configuration.microphoneEnabled && microphone == nil { try await enableMicrophone(configuration.microphoneID) }
-            else if !configuration.microphoneEnabled, let microphone { await microphone.stop(); self.microphone = nil }
         }
         mixer.configure(configuration)
     }
     nonisolated func appendSystemAudio(_ sample: CMSampleBuffer) {
         do { try mixer.append(sample, microphone: false) } catch { state.fail("System audio format or clock changed. Restart the session.") }
+    }
+    nonisolated func appendEchoReference(_ sample: CMSampleBuffer) {
+        // Missing/invalid references are detected by the mixer's per-frame tags.
+        try? mixer.appendReference(sample)
     }
 
     func stop(videoFrames: Int64? = nil) async {
@@ -233,6 +248,7 @@ final class MediaOutput {
             if state.audioFrames < target && state.error == nil { state.fail("Audio could not drain to the final video timestamp") }
         }
         writer?.cancel(); await writer?.value; writer = nil
+        mixer.reset(configuration: StudioConfiguration(), synthetic: false)
         try? audioHandle?.close(); audioHandle = nil
         try? videoHandle?.close(); videoHandle = nil
         if let child = process {
@@ -260,6 +276,7 @@ final class MediaOutput {
         try await capture.start(id: id)
         guard (active || previewActive), !stopping else { await capture.stop(); throw CancellationError() }
         microphone = capture
+        microphoneID = id
     }
     private func openTransport(_ url: URL) throws -> FileHandle {
         let fd = open(url.path, O_RDWR | O_NONBLOCK | O_CLOEXEC)
@@ -379,7 +396,10 @@ private final class MicrophoneCapture: NSObject, AVCaptureAudioDataOutputSampleB
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             queue.async {
                 do {
-                    guard let device = id.isEmpty ? AVCaptureDevice.default(for: .audio) : AVCaptureDevice(uniqueID: id) else { throw OutputError.message("Selected microphone is unavailable") }
+                    // Device lists load lazily; discover a saved microphone so external/Continuity devices resolve by ID.
+                    guard let device = id.isEmpty ? AVCaptureDevice.default(for: .audio)
+                            : AVCaptureDevice.DiscoverySession(deviceTypes: [.microphone, .external], mediaType: .audio, position: .unspecified)
+                                .devices.first(where: { $0.uniqueID == id }) ?? AVCaptureDevice(uniqueID: id) else { throw OutputError.message("Selected microphone is unavailable") }
                     let session = AVCaptureSession(); session.beginConfiguration()
                     let input = try AVCaptureDeviceInput(device: device)
                     guard session.canAddInput(input) else { throw OutputError.message("Cannot open microphone") }; session.addInput(input)
@@ -404,7 +424,12 @@ private final class MicrophoneCapture: NSObject, AVCaptureAudioDataOutputSampleB
         } }
     }
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        do { try mixer.append(sampleBuffer, microphone: true) } catch { state.fail("Microphone format or clock changed. Restart the session.") }
+        do {
+            guard let clock = session?.synchronizationClock else { throw OutputError.message("Microphone clock unavailable") }
+            let hostTime = CMSyncConvertTime(CMSampleBufferGetPresentationTimeStamp(sampleBuffer),
+                                            from: clock, to: CMClockGetHostTimeClock())
+            try mixer.append(sampleBuffer, microphone: true, hostTimestamp: hostTime.seconds)
+        } catch { state.fail("Microphone format or clock changed. Restart the session.") }
     }
     deinit {
         if let observer { NotificationCenter.default.removeObserver(observer) }
