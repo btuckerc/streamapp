@@ -70,6 +70,7 @@ else:
         pin.parent.mkdir(exist_ok=True)
         pin.write_text(requested + '\n')
 a.identity = requested
+print(run('python3', str(ROOT / 'scripts/build-aec.py')), end='')
 print(run('python3', str(ROOT / 'scripts/build-ffmpeg.py')), end='')
 print(run('swift', 'build', '-c', 'release'), end='')
 binary_dir = Path(run('swift', 'build', '-c', 'release', '--show-bin-path').strip())
