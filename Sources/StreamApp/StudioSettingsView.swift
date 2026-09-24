@@ -1,5 +1,83 @@
 import SwiftUI
 import AppKit
+import Combine
+
+extension StudioModel.SettingsTab {
+    var title: String {
+        switch self {
+        case .sources: "Capture"
+        case .audio: "Audio"
+        case .layout: "Layout"
+        case .chat: "Chat"
+        case .teleprompter: "Prompter"
+        case .drawing: "Drawing"
+        case .outputs: "Output"
+        }
+    }
+    var symbol: String {
+        switch self {
+        case .sources: "display"
+        case .audio: "waveform"
+        case .layout: "rectangle.3.group"
+        case .chat: "bubble.left.and.text.bubble.right"
+        case .teleprompter: "text.bubble"
+        case .drawing: "pencil.tip"
+        case .outputs: "antenna.radiowaves.left.and.right"
+        }
+    }
+}
+
+/// Settings window in the system Settings idiom: AppKit's toolbar-style tab controller
+/// supplies the preference toolbar, pane selection and window title; each pane is SwiftUI.
+/// Pane views load on first selection, and all panes share one size so switching never resizes.
+@MainActor
+final class StudioSettingsController: NSTabViewController {
+    private let model: StudioModel
+    private var previewSubscription: AnyCancellable?
+
+    init(model: StudioModel, openOnboarding: @escaping () -> Void) {
+        self.model = model
+        super.init(nibName: nil, bundle: nil)
+        model.loadDevices()
+        tabStyle = .toolbar
+        transitionOptions = [] // switch panes immediately, without a crossfade
+        for tab in StudioModel.SettingsTab.allCases {
+            let host = NSHostingController(rootView: StudioSettings(model: model, engine: model.engine, tab: tab, openOnboarding: openOnboarding))
+            host.sizingOptions = [.preferredContentSize]
+            host.title = tab.title // the tab controller shows the selected pane's title in the window, as system Settings does
+            let item = NSTabViewItem(viewController: host)
+            item.label = tab.title
+            item.image = NSImage(systemSymbolName: tab.symbol, accessibilityDescription: nil)
+            addTabViewItem(item)
+        }
+        selectedTabViewItemIndex = StudioModel.SettingsTab.allCases.firstIndex(of: model.settingsTab) ?? 0
+        // The Layout pane's preview runs only while that pane is showing in a visible window.
+        let engine = model.engine
+        previewSubscription = Publishers.CombineLatest3(model.$settingsVisible, model.$settingsTab, engine.$videoPreviewMode)
+            .map { visible, tab, mode in visible && tab == .layout && mode != nil }
+            .removeDuplicates()
+            .sink { [weak model] visible in
+                guard let model else { return }
+                Task { await engine.setSettingsPreview(visible: visible, configuration: model.configuration, synthetic: model.demo) }
+            }
+    }
+
+    @available(*, unavailable) required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
+
+    override func tabView(_ tabView: NSTabView, didSelect tabViewItem: NSTabViewItem?) {
+        super.tabView(tabView, didSelect: tabViewItem)
+        let tabs = StudioModel.SettingsTab.allCases
+        if tabs.indices.contains(selectedTabViewItemIndex) { model.settingsTab = tabs[selectedTabViewItemIndex] }
+    }
+
+    func makeWindow() -> NSWindow {
+        let window = NSWindow(contentViewController: self)
+        window.styleMask = [.titled, .closable, .miniaturizable]
+        window.toolbarStyle = .preference
+        window.isReleasedWhenClosed = false
+        return window
+    }
+}
 
 private struct SliderValueRow: View {
     let title: String
@@ -39,23 +117,15 @@ private struct SettingResetButton: View {
 struct StudioSettings: View {
     @ObservedObject var model: StudioModel
     @ObservedObject var engine: StudioEngine
+    let tab: StudioModel.SettingsTab
     let openOnboarding: () -> Void
     @State private var confirmRestoreAll = false
     private let defaults = StudioConfiguration()
 
     var body: some View {
-        VStack(spacing: 12) {
-            TabView(selection: $model.settingsTab) {
-                captureTab.tabItem { Label("Capture", systemImage: "display") }.tag(StudioModel.SettingsTab.sources)
-                audioTab.tabItem { Label("Audio", systemImage: "waveform") }.tag(StudioModel.SettingsTab.audio)
-                layoutTab.tabItem { Label("Layout", systemImage: "rectangle.3.group") }.tag(StudioModel.SettingsTab.layout)
-                chatTab.tabItem { Label("Chat", systemImage: "bubble.left.and.text.bubble.right") }.tag(StudioModel.SettingsTab.chat)
-                TeleprompterControls(model: model)
-                    .tabItem { Label("Prompter", systemImage: "text.bubble") }.tag(StudioModel.SettingsTab.teleprompter)
-                AnnotationSettingsView(settings: model.annotationSettings)
-                    .tabItem { Label("Drawing", systemImage: "pencil.tip") }.tag(StudioModel.SettingsTab.drawing)
-                outputTab.tabItem { Label("Output", systemImage: "antenna.radiowaves.left.and.right") }.tag(StudioModel.SettingsTab.outputs)
-            }
+        VStack(spacing: 0) {
+            pane
+            Divider()
             HStack {
                 Button("Run Setup…", action: openOnboarding).disabled(engine.isRunning || model.busy)
                 if let message = model.message {
@@ -64,8 +134,8 @@ struct StudioSettings: View {
                 Spacer()
                 Button("Restore Defaults…", role: .destructive) { confirmRestoreAll = true }
                     .disabled(model.busy || engine.isRunning)
-            }
-        }.padding(16).frame(width: 680, height: 620).disabled(model.busy)
+            }.padding(.horizontal, 20).padding(.vertical, 14)
+        }.frame(width: 680, height: 580).disabled(model.busy)
         .alert("Restore all defaults?", isPresented: $confirmRestoreAll) {
             Button("Restore Defaults", role: .destructive) {
                 Task { await model.restoreAllDefaults() }
@@ -74,11 +144,17 @@ struct StudioSettings: View {
         } message: {
             Text("Recordings, credentials, and permissions are kept.")
         }
-        .onAppear { model.loadDevices() }
-        .task(id: model.settingsVisible && model.settingsTab == .layout && engine.videoPreviewMode != nil) {
-            await engine.setSettingsPreview(
-                visible: model.settingsVisible && model.settingsTab == .layout && engine.videoPreviewMode != nil,
-                configuration: model.configuration, synthetic: model.demo)
+    }
+
+    @ViewBuilder private var pane: some View {
+        switch tab {
+        case .sources: captureTab
+        case .audio: audioTab
+        case .layout: layoutTab
+        case .chat: chatTab
+        case .teleprompter: TeleprompterControls(model: model)
+        case .drawing: AnnotationSettingsView(settings: model.annotationSettings)
+        case .outputs: outputTab
         }
     }
 
@@ -231,7 +307,8 @@ struct StudioSettings: View {
     }
     private var layoutTab: some View {
         VStack(spacing: 0) {
-            StudioVideoPreview(model: model, engine: engine).padding(12)
+            StudioVideoPreview(model: model, engine: engine).padding([.horizontal, .top], 20).padding(.bottom, 12)
+            Divider()
             Form {
                 Section("Scene") {
                     setting("Scene", \.layout) {
@@ -300,10 +377,6 @@ struct StudioSettings: View {
                     }
                 }
             }.formStyle(.grouped)
-                .overlay(alignment: .top) {
-                    LinearGradient(colors: [.black.opacity(0.22), .clear], startPoint: .top, endPoint: .bottom)
-                        .frame(height: 12).allowsHitTesting(false).accessibilityHidden(true)
-                }
         }
     }
     private var backgroundColor: Binding<Color> {

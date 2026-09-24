@@ -20,7 +20,7 @@ enum CaptureAccess: Equatable { case notDetermined, allowed, denied, restricted 
 
 @MainActor
 final class StudioModel: ObservableObject {
-    enum SettingsTab: Hashable { case sources, audio, layout, chat, teleprompter, drawing, outputs }
+    enum SettingsTab: Hashable, CaseIterable { case sources, audio, layout, chat, teleprompter, drawing, outputs }
     @Published var settingsTab: SettingsTab = .sources
     @Published var settingsVisible = false
     let engine = StudioEngine()

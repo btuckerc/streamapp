@@ -139,21 +139,21 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
             self?.item.button?.toolTip = running ? "StreamApp — Session active" : "StreamApp — Idle"
         }
         if arguments.contains("--ui-smoke") || arguments.contains("--settings-smoke") {
-            let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 420, height: 780), styleMask: [.titled, .closable], backing: .buffered, defer: false)
-            window.title = arguments.contains("--settings-smoke") ? "StreamApp Settings — Interface Check" : "StreamApp — Interface Check"
+            let window: NSWindow
             if arguments.contains("--settings-smoke") {
-                window.toolbarStyle = .preference
-                window.contentView = NSHostingView(rootView: StudioSettings(model: model, engine: model.engine, openOnboarding: { [weak self] in self?.showOnboarding() }))
-            }
-            else {
+                window = StudioSettingsController(model: model, openOnboarding: { [weak self] in self?.showOnboarding() }).makeWindow()
+                window.setFrameTopLeftPoint(NSPoint(x: 80, y: (NSScreen.main?.visibleFrame.maxY ?? 900) - 80))
+                model.settingsVisible = true
+            } else {
+                window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 420, height: 780), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+                window.title = "StreamApp — Interface Check"
                 window.contentView = NSHostingView(rootView: controls)
+                if let content = window.contentView { window.setContentSize(content.fittingSize) }
+                window.isReleasedWhenClosed = false
                 // Same live meters/preview as an opened popover (synthetic in smoke mode).
                 Task { await model.engine.setMenuPreview(visible: true, configuration: model.configuration, synthetic: model.demo) }
             }
-            if let content = window.contentView { window.setContentSize(content.fittingSize) }
-            window.isReleasedWhenClosed = false
             window.delegate = self
-            if arguments.contains("--settings-smoke") { model.settingsVisible = true }
             window.orderBack(nil)
             inspectionWindow = window
         }
@@ -260,11 +260,8 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
     private func showSettings() {
         popover.performClose(nil)
         if settingsWindow == nil {
-            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 620), styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
-            window.title = "StreamApp Settings"; window.isReleasedWhenClosed = false
-            window.toolbarStyle = .preference // centered pane tabs, as in system Settings windows
+            let window = StudioSettingsController(model: model, openOnboarding: { [weak self] in self?.showOnboarding() }).makeWindow()
             window.delegate = self
-            window.contentView = NSHostingView(rootView: StudioSettings(model: model, engine: model.engine, openOnboarding: { [weak self] in self?.showOnboarding() }))
             window.center(); settingsWindow = window
         }
         settingsWindow?.makeKeyAndOrderFront(nil)

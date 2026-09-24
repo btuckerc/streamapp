@@ -1,5 +1,11 @@
 # Verification — 2026-09-20
 
+## Native Settings window — 2026-09-24
+
+- Settings used a SwiftUI `TabView` inside an `NSWindow` whose `.preference` toolbar style had no toolbar. The segmented tab control was drawn into the titlebar beside the traffic lights, adding vertical space and offsetting them, and it switched to Liquid Glass when clicked. `StudioSettingsController` (`NSTabViewController`, `.toolbar` tab style, `.preference` window) now provides the system preference toolbar, glass selection and per-pane window title. Pane switches have no crossfade, each pane's SwiftUI view loads when first selected, and all panes are 680 × 580 pt, so switching does not resize the window.
+- The Layout preview's on/off state moved from a view `.task` to a Combine subscription on `settingsVisible`, `settingsTab` and `videoPreviewMode`. The Layout pane's hand-drawn gradient shadow became a `Divider`, and the footer sits below a `Divider`.
+- A packaged `--settings-smoke` run was checked with Computer Use. The toolbar showed seven icon panes, with traffic lights on the title row. Selecting Layout then Output changed the pane and the window title ("Output"). Choosing Layout in the Preview picker started the synthetic preview in the Layout pane. `swift test` passed 71 tests.
+
 ## Echo cancellation performance and accuracy — 2026-09-24
 
 - The shipped WebRTC build ran AEC3 without SIMD: upstream Meson `neon=auto` never defines `WEBRTC_HAS_NEON` (0 of 409 compile commands had it), and release builds also left DCHECKs enabled. `scripts/build-aec.py` now forces NEON on arm64 and `NDEBUG`; 251 of 409 units compile with NEON, all 409 with `NDEBUG`.
