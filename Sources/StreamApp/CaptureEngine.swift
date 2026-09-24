@@ -37,6 +37,8 @@ final class StudioEngine: ObservableObject {
     @Published private(set) var cameraStatus: String?
     /// Most recent recording file that exists on disk; cleared when the next session starts.
     @Published private(set) var lastRecordingURL: URL?
+    /// Encoder progress of the running session (frames/seconds from FFmpeg `-progress`); nil when idle.
+    var outputHealthSnapshot: MediaOutput.Health? { output?.health }
     var annotationWindowID: CGWindowID?
     var teleprompterWindowIDs: Set<CGWindowID> = []
     private var captureFilterRevision: UInt64 = 0

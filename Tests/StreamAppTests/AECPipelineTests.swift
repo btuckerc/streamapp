@@ -112,16 +112,45 @@ struct AECPipelineTests {
                 seed = 1664525 &* seed &+ 1013904223
                 let playback = (Float(seed >> 8) / 16_777_216 - 0.5) * 0.15
                 let voice = Float(sin(Double(block * 480 + frame) * 0.047)) * 0.008
-                reference[2 * frame] = playback; reference[2 * frame + 1] = playback
-                microphone[2 * frame] = 0.3 * playback + voice
+                // The speaker echo arrives one block (10 ms) after its reference.
+                microphone[2 * frame] = 0.3 * reference[2 * frame] + voice
                 microphone[2 * frame + 1] = microphone[2 * frame]
+                reference[2 * frame] = playback; reference[2 * frame + 1] = playback
             }
             #expect(sa_aec_process(control, reference, microphone, &expected) == 0)
             #expect(sa_aec_process(toggled, reference, microphone, &actual) == 0)
-            // Once optional cleanup is off, cancellation must immediately match
-            // uninterrupted AEC—not restart its room-learning/convergence phase.
-            if block < 1000 || block >= 1200 { #expect(actual == expected) }
+            // Once optional cleanup is off, cancellation must match uninterrupted
+            // AEC—not restart its room-learning/convergence phase. Block 1200
+            // still carries the last NS block's band-synthesis filter tail.
+            if block < 1000 || block > 1200 { #expect(actual == expected) }
         }
+    }
+
+    @Test func playbackBeyondFullScaleIsStillCancelled() throws {
+        // System audio can exceed ±1; the reference must not bypass AEC then.
+        let canceller = try #require(sa_aec_create(1, 0))
+        defer { sa_aec_destroy(canceller) }
+        var reference = [Float](repeating: 0, count: 960)
+        var microphone = reference, output = reference
+        var microphoneEnergy = 0.0, outputEnergy = 0.0
+        var seed: UInt32 = 9173
+        for block in 0..<1000 {
+            for frame in 0..<480 {
+                seed = 1664525 &* seed &+ 1013904223
+                let playback = (Float(seed >> 8) / 16_777_216 - 0.5) * 2.8
+                // Speakers clip the playback; its echo arrives one block later.
+                microphone[2 * frame] = 0.3 * min(max(reference[2 * frame], -1), 1)
+                microphone[2 * frame + 1] = microphone[2 * frame]
+                reference[2 * frame] = playback; reference[2 * frame + 1] = playback
+            }
+            #expect(sa_aec_process(canceller, reference, microphone, &output) == 0)
+            guard block >= 500 else { continue }
+            for frame in 0..<480 {
+                microphoneEnergy += Double(microphone[2 * frame] * microphone[2 * frame])
+                outputEnergy += Double(output[2 * frame] * output[2 * frame])
+            }
+        }
+        #expect(10 * log10(microphoneEnergy / outputEnergy) > 20)
     }
 
     private func configuration() -> StudioConfiguration {

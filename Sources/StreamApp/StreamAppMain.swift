@@ -36,7 +36,7 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
     func applicationDidFinishLaunching(_ notification: Notification) {
         let arguments = CommandLine.arguments
         let smoke = arguments.contains("--smoke")
-        model = StudioModel(demo: smoke || arguments.contains("--demo") || arguments.contains("--ui-smoke") || arguments.contains("--settings-smoke") || arguments.contains("--onboarding-smoke"))
+        model = StudioModel(demo: smoke || arguments.contains("--demo") || arguments.contains("--bench") || arguments.contains("--ui-smoke") || arguments.contains("--settings-smoke") || arguments.contains("--onboarding-smoke"))
         if smoke {
             Task { await runSmoke(arguments) }
             return
@@ -161,6 +161,7 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
         else if !model.demo && !model.onboardingCompleted { showOnboarding() }
         print("StreamApp ready — idle; no capture started")
         fflush(stdout)
+        if arguments.contains("--bench") { Task { await runBench(arguments) } }
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
@@ -410,6 +411,82 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
         } catch {
             await model.engine.stop()
             fputs("SMOKE FAILED: \(error.localizedDescription)\n", stderr)
+            exit(1)
+        }
+    }
+
+    /// Real (non-synthetic) main-display session for `bench/run.py`. Uses the non-persisting demo
+    /// model, so user settings, keys and Twitch state are never read or written. Emits one
+    /// `BENCH {json}` line per event, timestamped with CLOCK_UPTIME_RAW like the harness probe.
+    private func runBench(_ arguments: [String]) async {
+        func value(_ flag: String) -> String? {
+            guard let i = arguments.firstIndex(of: flag), arguments.indices.contains(i + 1) else { return nil }
+            return arguments[i + 1]
+        }
+        func event(_ name: String, _ fields: [String: Any] = [:]) {
+            var record = fields
+            record["event"] = name; record["t_ns"] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+            if let data = try? JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]) {
+                print("BENCH " + String(decoding: data, as: UTF8.self))
+            }
+            fflush(stdout)
+        }
+        do {
+            event("ready")
+            guard let path = value("--bench") else { throw SmokeError.message("--bench needs an output directory") }
+            func duration(_ flag: String, default fallback: Double, range: ClosedRange<Double>) throws -> Double {
+                guard let seconds = Double(value(flag) ?? String(fallback)), seconds.isFinite, range.contains(seconds) else {
+                    throw SmokeError.message("\(flag) must be \(range.lowerBound)–\(range.upperBound) seconds")
+                }
+                return seconds
+            }
+            let seconds = try duration("--bench-seconds", default: 30, range: 1...3600)
+            // Idle time after launch, before the session starts (the idle scenario never starts one).
+            let delay = try duration("--bench-delay", default: 0, range: 0...600)
+            if arguments.contains("--bench-idle") {
+                try await Task.sleep(for: .seconds(delay + seconds))
+                event("done")
+                NSApplication.shared.terminate(nil)
+                return
+            }
+            let directory = URL(fileURLWithPath: path, isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            var c = StudioConfiguration()
+            c.displayID = CGMainDisplayID()
+            c.chatEnabled = false; c.cameraEnabled = false
+            c.microphoneEnabled = arguments.contains("--bench-microphone")
+            c.systemAudioEnabled = !arguments.contains("--bench-no-system-audio")
+            c.recordingDirectory = directory.path
+            c.recordingEnabled = !arguments.contains("--bench-no-record")
+            var key = ""
+            if let endpoint = value("--bench-rtmp") {
+                guard let url = URL(string: endpoint), url.scheme == "rtmp", ["127.0.0.1", "localhost", "::1"].contains(url.host ?? "") else {
+                    throw SmokeError.message("--bench-rtmp must be a loopback rtmp:// URL")
+                }
+                c.streamingEnabled = true; c.streamService = .custom; c.streamURL = endpoint
+                key = value("--bench-stream-key") ?? "bench"
+            }
+            // The model forwards its configuration to the running engine, so it must hold the bench one.
+            model.configuration = c
+            if delay > 0 { try await Task.sleep(for: .seconds(delay)) }
+            event("start_requested")
+            try await model.engine.start(configuration: model.configuration, streamKey: key, synthetic: false)
+            event("start_returned")
+            try await Task.sleep(for: .seconds(seconds))
+            guard model.engine.isRunning, model.engine.errorMessage == nil else { throw SmokeError.message(model.engine.errorMessage ?? "Session stopped") }
+            let health = model.engine.outputHealthSnapshot
+            event("stop_requested")
+            await model.engine.stop()
+            event("stopped", [
+                "frames": health?.frames ?? 0, "media_seconds": health?.mediaSeconds ?? 0,
+                "recording": model.engine.lastRecordingURL?.path ?? NSNull(),
+                "error": model.engine.errorMessage ?? NSNull(),
+            ])
+            if let error = model.engine.errorMessage { throw SmokeError.message(error) }
+            NSApplication.shared.terminate(nil)
+        } catch {
+            await model.engine.stop()
+            event("failed", ["error": error.localizedDescription])
             exit(1)
         }
     }

@@ -57,8 +57,11 @@ with (AEC / 'build.lock').open('w') as lock:
         # Generated, precisely scoped dependency output only; never source/user files.
         shutil.rmtree(BUILD)
     if not (BUILD / 'build.ninja').exists():
-        print(run(*command, 'setup', str(BUILD), str(SOURCE), '--buildtype=release',
-                  '--default-library=static', '--wrap-mode=forcefallback'), end='')
+        # Upstream's `neon=auto` never defines WEBRTC_HAS_NEON, leaving AEC3 on
+        # scalar code; release must also define NDEBUG to compile out DCHECKs.
+        neon = ['-Dneon=enabled'] if platform.machine() == 'arm64' else []
+        print(run(*command, 'setup', str(BUILD), str(SOURCE), '--buildtype=release', '-Db_ndebug=true',
+                  *neon, '--default-library=static', '--wrap-mode=forcefallback'), end='')
     print(run('ninja', '-C', str(BUILD), '-j', str(min(os.cpu_count() or 2, 6))), end='')
     archives = sorted(BUILD.rglob('*.a'))
     if not archives or not (ABSEIL / 'absl/base/config.h').is_file():
@@ -79,6 +82,5 @@ with (AEC / 'build.lock').open('w') as lock:
     shutil.copy2(ABSEIL / 'LICENSE', notices / 'Abseil-LICENSE')
     shutil.copy2(SOURCE / 'subprojects/abseil-cpp.wrap', notices / 'abseil-cpp.wrap')
     (notices / 'provenance.json').write_text(json.dumps({**identity, 'repository': REPOSITORY,
-        'tag': 'v2.1', 'abseil': '20240722.0', 'configuration': 'Meson release/static; pinned wrap checksum validation'}, indent=2))
-    stamp.write_text(json.dumps(identity, indent=2))
+        'tag': 'v2.1', 'abseil': '20240722.0', 'configuration': 'Meson release/static, NDEBUG, NEON on arm64; pinned wrap checksum validation'}, indent=2))
     print(f'Built static AEC dependency: {LIB}')
