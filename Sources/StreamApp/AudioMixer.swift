@@ -14,18 +14,21 @@ struct AudioLevel: Equatable, Sendable {
 
 /// Fixed-capacity, host-clock aligned audio. Late samples never replay later.
 final class AudioMixer: @unchecked Sendable {
-    typealias Levels = (microphone: AudioLevel, system: AudioLevel, output: AudioLevel, gainReduction: Float)
+    typealias Levels = (microphone: AudioLevel, system: AudioLevel, output: AudioLevel, gainReduction: Float, limiterReduction: Float)
     private static let capacity = 96_000
     private let lock = NSLock()
     private var microphone = [Float](repeating: 0, count: capacity * 2)
     private var system = [Float](repeating: 0, count: capacity * 2)
     private var configuration = StudioConfiguration()
+    /// The newest configuration requested while a session runs; every applied one is masked by it.
+    private var requested: StudioConfiguration?
     private var cursor: Int64 = 0
     private var epoch = 0.0
     private var synthetic = false
-    private var meters: (microphone: Float, system: Float, output: Float, gainReduction: Float) = (0, 0, 0, 0)
-    private var pendingMeters: (microphone: Float, system: Float, output: Float, gainReduction: Float) = (0, 0, 0, 0)
+    private var meters: (microphone: Float, system: Float, output: Float, gainReduction: Float, limiterReduction: Float) = (0, 0, 0, 0, 0)
+    private var pendingMeters: (microphone: Float, system: Float, output: Float, gainReduction: Float, limiterReduction: Float) = (0, 0, 0, 0, 0)
     private var microphoneCompressor = StereoCompressor()
+    private var ducker = Ducker()
     private var outputProtectionGain: Float = 1
     private let meterReleasePerSample = exp(log(0.01) / (0.15 * 48_000))
     private let outputProtectionRelease: Float = Float(1 - exp(-1 / (0.150 * 48_000)))
@@ -56,6 +59,20 @@ final class AudioMixer: @unchecked Sendable {
         return configuration.microphoneEchoCancellationEnabled ? echoStatus : nil
     }
 
+    /// A vanished device must not leave queued speech or DSP history audible.
+    /// The program cursor keeps advancing; returning host timestamps rejoin it.
+    func silenceMicrophone() {
+        // Never acquire a converter lock while holding the mixer lock: conversion
+        // calls its consumer with that lock held in the opposite order.
+        microphoneConverter.reset()
+        lock.lock(); defer { lock.unlock() }
+        microphone.withUnsafeMutableBufferPointer { $0.initialize(repeating: 0) }
+        microphoneCompressor.reset()
+        meters.microphone = 0; pendingMeters.microphone = 0
+        meters.gainReduction = 0; pendingMeters.gainReduction = 0
+        microphoneLoudness.reset()
+        resetEcho()
+    }
     private func resetEcho() {
         revision &+= 1
         let echo = configuration.microphoneEchoCancellationEnabled
@@ -64,7 +81,7 @@ final class AudioMixer: @unchecked Sendable {
         referencePositions.removeAll(keepingCapacity: echo)
         microphonePositions.removeAll(keepingCapacity: processing)
         reference.removeAll(keepingCapacity: echo)
-        cleanedStart = -1; nextBlock = cursor
+        cleanedStart = -1; nextBlock = max(0, cursor - AudioSync.frames(configuration.microphoneSyncOffsetMs))
         nextMicrophonePosition = nil; nextReferencePosition = nil
         if let canceller { sa_aec_destroy(canceller); self.canceller = nil }
         echoStatus = nil
@@ -102,9 +119,10 @@ final class AudioMixer: @unchecked Sendable {
             // two frames apart. Larger discontinuities remain actual gaps.
             if let nextReferencePosition, abs(first - nextReferencePosition) <= 2 { first = nextReferencePosition }
             nextReferencePosition = first + Int64(frames)
+            let boundary = max(0, cursor - AudioSync.frames(configuration.microphoneSyncOffsetMs))
             for frame in 0..<frames {
                 let position = first + Int64(frame)
-                guard position >= cursor, position < cursor + Int64(Self.capacity) else { continue }
+                guard position >= boundary, position < boundary + Int64(Self.capacity) else { continue }
                 let slot = Int(position % Int64(Self.capacity))
                 referencePositions[slot] = position
                 reference[slot * 2] = pointer[frame * 2]
@@ -152,29 +170,41 @@ final class AudioMixer: @unchecked Sendable {
 
     func reset(configuration: StudioConfiguration, synthetic: Bool, epoch: Double = CMClockGetTime(CMClockGetHostTimeClock()).seconds) {
         lock.lock(); defer { lock.unlock() }
-        self.configuration = configuration; self.synthetic = synthetic
+        self.configuration = configuration; self.synthetic = synthetic; requested = nil
         cursor = 0; self.epoch = epoch
         microphone.withUnsafeMutableBufferPointer { $0.initialize(repeating: 0) }
         system.withUnsafeMutableBufferPointer { $0.initialize(repeating: 0) }
-        microphoneCompressor.reset()
+        microphoneCompressor.reset(); ducker.reset()
         outputProtectionGain = 1
-        meters = (0, 0, 0, 0); pendingMeters = (0, 0, 0, 0)
+        meters = (0, 0, 0, 0, 0); pendingMeters = (0, 0, 0, 0, 0)
         microphoneLoudness.reset(); systemLoudness.reset(); outputLoudness.reset()
         resetEcho()
     }
-    func configure(_ configuration: StudioConfiguration) {
+    /// Silences the microphone now when `newer` does, ahead of the queued update that commits it, and
+    /// keeps it silent through older updates committing first (see `StudioConfiguration.hiding(as:)`).
+    /// If that update fails, the mask stays until the next request: failing safe, like the video mask.
+    func hide(as newer: StudioConfiguration) {
+        lock.lock(); requested = newer; let current = configuration; lock.unlock()
+        configure(current)
+    }
+    func configure(_ next: StudioConfiguration) {
         lock.lock(); defer { lock.unlock() }
-        if self.configuration.microphoneEnabled != configuration.microphoneEnabled || self.configuration.microphoneID != configuration.microphoneID {
+        let configuration = requested.map { next.hiding(as: $0) } ?? next
+        if self.configuration.microphoneEnabled != configuration.microphoneEnabled || self.configuration.microphoneID != configuration.microphoneID ||
+            self.configuration.microphoneChannels != configuration.microphoneChannels ||
+            self.configuration.microphoneSyncOffsetMs != configuration.microphoneSyncOffsetMs {
             microphone.withUnsafeMutableBufferPointer { $0.initialize(repeating: 0) }
         }
-        if self.configuration.systemAudioEnabled != configuration.systemAudioEnabled {
+        if self.configuration.systemAudioEnabled != configuration.systemAudioEnabled ||
+            self.configuration.systemAudioSyncOffsetMs != configuration.systemAudioSyncOffsetMs {
             system.withUnsafeMutableBufferPointer { $0.initialize(repeating: 0) }
         }
         if self.configuration.microphoneCompressionEnabled && !configuration.microphoneCompressionEnabled {
             microphoneCompressor.reset()
             meters.gainReduction = 0; pendingMeters.gainReduction = 0
         }
-        if (!self.configuration.microphoneMuted && configuration.microphoneMuted) ||
+        if configuration.systemAudioDucking == .off { ducker.reset() }
+        if (!self.configuration.microphoneSilenced && configuration.microphoneSilenced) ||
             self.configuration.microphoneEnabled != configuration.microphoneEnabled {
             microphoneCompressor.reset()
             meters.microphone = 0; meters.gainReduction = 0
@@ -187,7 +217,9 @@ final class AudioMixer: @unchecked Sendable {
         }
         let resetEchoState = self.configuration.microphoneEchoCancellationEnabled != configuration.microphoneEchoCancellationEnabled ||
             self.configuration.microphoneEnabled != configuration.microphoneEnabled ||
-            self.configuration.microphoneID != configuration.microphoneID
+            self.configuration.microphoneID != configuration.microphoneID ||
+            self.configuration.microphoneChannels != configuration.microphoneChannels ||
+            self.configuration.microphoneSyncOffsetMs != configuration.microphoneSyncOffsetMs
         let noiseChanged = self.configuration.microphoneNoiseReductionEnabled != configuration.microphoneNoiseReductionEnabled
         self.configuration = configuration
         if resetEchoState {
@@ -209,11 +241,12 @@ final class AudioMixer: @unchecked Sendable {
     func append(_ sample: CMSampleBuffer, microphone isMicrophone: Bool, hostTimestamp: Double? = nil) throws {
         lock.lock()
         let enabled = isMicrophone ? configuration.microphoneEnabled : configuration.systemAudioEnabled
+        let selection = isMicrophone ? configuration.microphoneChannels : .deviceDefault
         let revision = self.revision
         lock.unlock()
         guard enabled else { return }
         let converter = isMicrophone ? microphoneConverter : systemConverter
-        try converter.convert(sample) { pointer, frames in
+        try converter.convert(sample, selection: selection) { pointer, frames in
             let timestamp = hostTimestamp ?? CMSampleBufferGetPresentationTimeStamp(sample).seconds
             lock.lock(); defer { lock.unlock() }
             guard isMicrophone ? configuration.microphoneEnabled : configuration.systemAudioEnabled else { return }
@@ -227,9 +260,10 @@ final class AudioMixer: @unchecked Sendable {
                 if let nextMicrophonePosition, abs(first - nextMicrophonePosition) <= 2 { first = nextMicrophonePosition }
                 nextMicrophonePosition = first + Int64(frames)
             }
+            let boundary = max(0, cursor - AudioSync.frames(isMicrophone ? configuration.microphoneSyncOffsetMs : configuration.systemAudioSyncOffsetMs))
             for frame in 0..<frames {
                 let position = first + Int64(frame)
-                guard position >= cursor, position < cursor + Int64(Self.capacity) else { continue }
+                guard position >= boundary, position < boundary + Int64(Self.capacity) else { continue }
                 let index = Int(position % Int64(Self.capacity)) * 2
                 if isMicrophone {
                     microphone[index] = pointer[frame * 2]; microphone[index + 1] = pointer[frame * 2 + 1]
@@ -245,34 +279,49 @@ final class AudioMixer: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         let c = configuration
         let frames = destination.count / 2
-        let micGain = c.microphoneEnabled && !c.microphoneMuted ? Float(c.microphoneGain) : 0
+        let micGain = c.microphoneEnabled && !c.microphoneSilenced ? Float(c.microphoneGain) : 0
         let sysGain = c.systemAudioEnabled && !c.systemAudioMuted ? Float(c.systemAudioGain) : 0
+        let ducking = c.systemAudioDucking != .off
+        let duckedGain = Float(pow(10, -c.systemAudioDucking.depth / 20))
         var micPeak: Float = 0
         var sysPeak: Float = 0
         var outputPeak: Float = 0
         var minimumGain: Float = 1
+        var minimumLimiterGain: Float = 1
+        let micOffset = AudioSync.frames(c.microphoneSyncOffsetMs)
+        let sysOffset = AudioSync.frames(c.systemAudioSyncOffsetMs)
         let processingEnabled = c.microphoneEnabled && (c.microphoneEchoCancellationEnabled || c.microphoneNoiseReductionEnabled) && !synthetic
         var offset = 0
         while offset < frames {
-            let start = cursor + Int64(offset)
-            if processingEnabled && start >= nextBlock { prepareEchoBlock(at: start) }
-            let end = processingEnabled ? min(frames, offset + Int(nextBlock - start)) : frames
+            // AEC's microphone and private reference always use the same raw time.
+            // Presentation offsets move the processed bus, never the echo path.
+            let start = cursor + Int64(offset) - micOffset
+            if processingEnabled && start >= 0 && start >= nextBlock { prepareEchoBlock(at: start) }
+            let end = processingEnabled && start >= 0 ? min(frames, offset + Int(nextBlock - start)) :
+                (processingEnabled && start < 0 ? min(frames, offset + Int(-start)) : frames)
             for frame in offset..<end {
             let position = cursor + Int64(frame)
-            let index = Int(position % Int64(Self.capacity)) * 2
-            let micSignal = synthetic ? Float(sin(Double(position) * 2 * .pi * 440 / 48_000) * 0.12) : 0
-            let sysSignal = synthetic ? Float(sin(Double(position) * 2 * .pi * 880 / 48_000) * 0.08) : 0
-            let cleanedOffset = Int(position - cleanedStart) * 2
+            let micPosition = position - micOffset
+            let sysPosition = position - sysOffset
+            let micIndex = Int(max(0, micPosition) % Int64(Self.capacity)) * 2
+            let sysIndex = Int(max(0, sysPosition) % Int64(Self.capacity)) * 2
+            let micSignal = synthetic ? Float(sin(Double(micPosition) * 2 * .pi * 440 / 48_000) * 0.12) : 0
+            let sysSignal = synthetic ? Float(sin(Double(sysPosition) * 2 * .pi * 880 / 48_000) * 0.08) : 0
+            let cleanedOffset = Int(micPosition - cleanedStart) * 2
             let useCleaned = processingEnabled && cleanedStart >= 0 && cleanedOffset >= 0 && cleanedOffset < 960
-            var micLeft = (synthetic ? micSignal : (useCleaned ? cleanedBlock[cleanedOffset] : microphone[index])) * micGain
-            var micRight = (synthetic ? micSignal : (useCleaned ? cleanedBlock[cleanedOffset + 1] : microphone[index + 1])) * micGain
+            var micLeft = micPosition < 0 ? 0 : (synthetic ? micSignal : (useCleaned ? cleanedBlock[cleanedOffset] : microphone[micIndex])) * micGain
+            var micRight = micPosition < 0 ? 0 : (synthetic ? micSignal : (useCleaned ? cleanedBlock[cleanedOffset + 1] : microphone[micIndex + 1])) * micGain
             if c.microphoneCompressionEnabled && micGain > 0 {
                 let compressed = microphoneCompressor.process(left: micLeft, right: micRight)
                 micLeft = compressed.left; micRight = compressed.right
                 minimumGain = min(minimumGain, compressed.gain)
             }
-            let sysLeft = (synthetic ? sysSignal : system[index]) * sysGain
-            let sysRight = (synthetic ? sysSignal : system[index + 1]) * sysGain
+            var sysLeft = sysPosition < 0 ? 0 : (synthetic ? sysSignal : system[sysIndex]) * sysGain
+            var sysRight = sysPosition < 0 ? 0 : (synthetic ? sysSignal : system[sysIndex + 1]) * sysGain
+            if ducking {
+                let duck = ducker.process(trigger: max(abs(micLeft), abs(micRight)), duckedGain: duckedGain)
+                sysLeft *= duck; sysRight *= duck
+            }
             micPeak = max(micPeak, abs(micLeft), abs(micRight))
             sysPeak = max(sysPeak, abs(sysLeft), abs(sysRight))
             microphoneLoudness.process(left: micLeft, right: micRight)
@@ -287,19 +336,21 @@ final class AudioMixer: @unchecked Sendable {
                 outputProtectionGain += (1 - outputProtectionGain) * outputProtectionRelease
                 outputProtectionGain = min(outputProtectionGain, desiredGain)
             }
+            minimumLimiterGain = min(minimumLimiterGain, outputProtectionGain)
             let outLeft = sumLeft * outputProtectionGain
             let outRight = sumRight * outputProtectionGain
             destination[frame * 2] = outLeft
             destination[frame * 2 + 1] = outRight
             outputPeak = max(outputPeak, abs(outLeft), abs(outRight))
             outputLoudness.process(left: outLeft, right: outRight)
-            microphone[index] = 0; microphone[index + 1] = 0
-            system[index] = 0; system[index + 1] = 0
+            if micPosition >= 0 { microphone[micIndex] = 0; microphone[micIndex + 1] = 0 }
+            if sysPosition >= 0 { system[sysIndex] = 0; system[sysIndex + 1] = 0 }
             }
             offset = end
         }
         cursor += Int64(frames)
         let reductionPeak = minimumGain < 1 ? -20 * log10(minimumGain) : 0
+        let limiterPeak = minimumLimiterGain < 1 ? -20 * log10(minimumLimiterGain) : 0
         let release = Float(pow(meterReleasePerSample, Double(frames)))
         meters.microphone = max(micPeak, meters.microphone * release)
         meters.system = max(sysPeak, meters.system * release)
@@ -309,6 +360,8 @@ final class AudioMixer: @unchecked Sendable {
         pendingMeters.system = max(pendingMeters.system, sysPeak)
         pendingMeters.output = max(pendingMeters.output, outputPeak)
         pendingMeters.gainReduction = max(pendingMeters.gainReduction, reductionPeak)
+        meters.limiterReduction = max(limiterPeak, meters.limiterReduction * release)
+        pendingMeters.limiterReduction = max(pendingMeters.limiterReduction, limiterPeak)
     }
     var levels: Levels {
         lock.lock(); defer { lock.unlock() }
@@ -318,8 +371,9 @@ final class AudioMixer: @unchecked Sendable {
         let result = (microphone: level(max(meters.microphone, pendingMeters.microphone), microphoneLoudness),
                       system: level(max(meters.system, pendingMeters.system), systemLoudness),
                       output: level(max(meters.output, pendingMeters.output), outputLoudness),
-                      gainReduction: max(meters.gainReduction, pendingMeters.gainReduction))
-        pendingMeters = (0, 0, 0, 0)
+                      gainReduction: max(meters.gainReduction, pendingMeters.gainReduction),
+                      limiterReduction: max(meters.limiterReduction, pendingMeters.limiterReduction))
+        pendingMeters = (0, 0, 0, 0, 0)
         return result
     }
 }
@@ -410,23 +464,69 @@ private final class StereoCompressor {
     }
 }
 
+/// Voice-keyed ducker for the app-audio bus. A sample peak above −36 dBFS on the mixed microphone
+/// (OBS's documented sidechain threshold) marks speech and holds it for 200 ms so gaps between words
+/// do not pump. Gain moves toward the ducked level with a 50 ms time constant and recovers with
+/// 600 ms (OBS's documented release), within published 20–100 ms attack / 250–800 ms release ranges.
+private struct Ducker {
+    private var gain: Float = 1
+    private var holdRemaining = 0
+    private let threshold: Float = 0.015_849 // −36 dBFS
+    private let holdSamples = 9_600
+    private let attack: Float = Float(1 - exp(-1 / (0.050 * 48_000)))
+    private let release: Float = Float(1 - exp(-1 / (0.600 * 48_000)))
+
+    mutating func reset() { gain = 1; holdRemaining = 0 }
+
+    mutating func process(trigger: Float, duckedGain: Float) -> Float {
+        if trigger > threshold { holdRemaining = holdSamples } else if holdRemaining > 0 { holdRemaining -= 1 }
+        let target: Float = holdRemaining > 0 ? duckedGain : 1
+        gain += (target - gain) * (target < gain ? attack : release)
+        return gain
+    }
+}
+
 /// Each source owns a converter; AVAudioConverter preserves resampling phase.
 private final class PCMConverter: @unchecked Sendable {
     private let lock = NSLock()
     private var inputFormat: AVAudioFormat?
+    private var layoutConverter: AVAudioConverter?
+    private var planarInput: AVAudioPCMBuffer?
     private var inputDescription: CMAudioFormatDescription?
+    private var selection: AudioChannelSelection = .deviceDefault
     private var converter: AVAudioConverter?
     private var input: AVAudioPCMBuffer?
     private var output: AVAudioPCMBuffer?
     private let target = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000, channels: 2, interleaved: true)!
 
-    func convert(_ sample: CMSampleBuffer, consume: (UnsafePointer<Float>, Int) throws -> Void) throws {
+    func reset() {
+        lock.lock(); defer { lock.unlock() }
+        converter?.reset()
+        layoutConverter?.reset()
+    }
+
+    func convert(_ sample: CMSampleBuffer, selection: AudioChannelSelection = .deviceDefault,
+                 consume: (UnsafePointer<Float>, Int) throws -> Void) throws {
         lock.lock(); defer { lock.unlock() }
         guard let description = CMSampleBufferGetFormatDescription(sample) else { throw OutputError.message("Missing audio format") }
-        if inputDescription == nil || !CMFormatDescriptionEqual(inputDescription!, otherFormatDescription: description) {
+        if inputDescription == nil || !CMFormatDescriptionEqual(inputDescription!, otherFormatDescription: description) || self.selection != selection {
             let format = AVAudioFormat(cmAudioFormatDescription: description)
             inputDescription = description; inputFormat = format
-            converter = AVAudioConverter(from: format, to: target); input = nil; output = nil
+            let map = selection.channelMap(channelCount: Int(format.channelCount))
+            // Core Audio's channel-map fast path mis-strides interleaved multichannel
+            // input when reducing channel count. Normalize layout (not routing) first;
+            // the mapping converter still selects native channels before downmix/SRC.
+            var mappedFormat = format
+            layoutConverter = nil; planarInput = nil
+            if map != nil && format.isInterleaved && format.channelCount > 2 {
+                let layout = format.channelLayout ?? AVAudioChannelLayout(layoutTag: kAudioChannelLayoutTag_DiscreteInOrder | format.channelCount)!
+                mappedFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: format.sampleRate, interleaved: false, channelLayout: layout)
+                layoutConverter = AVAudioConverter(from: format, to: mappedFormat)
+                guard layoutConverter != nil else { throw OutputError.message("Unsupported interleaved device layout") }
+            }
+            converter = AVAudioConverter(from: mappedFormat, to: target); input = nil; output = nil
+            self.selection = selection
+            if let map { converter?.channelMap = map }
         }
         guard let format = inputFormat else { throw OutputError.message("Missing audio format") }
         let frames = CMSampleBufferGetNumSamples(sample)
@@ -441,10 +541,19 @@ private final class PCMConverter: @unchecked Sendable {
         input.frameLength = AVAudioFrameCount(frames)
         let copied = CMSampleBufferCopyPCMDataIntoAudioBufferList(sample, at: 0, frameCount: Int32(frames), into: input.mutableAudioBufferList)
         guard copied == noErr else { throw OutputError.message("Cannot read audio samples (\(copied))") }
+        var conversionInput = input
+        if let layoutConverter {
+            if planarInput == nil || planarInput!.frameCapacity < frames {
+                planarInput = AVAudioPCMBuffer(pcmFormat: layoutConverter.outputFormat, frameCapacity: AVAudioFrameCount(frames))
+            }
+            guard let planarInput else { throw OutputError.message("Cannot allocate device layout buffer") }
+            try layoutConverter.convert(to: planarInput, from: input)
+            conversionInput = planarInput
+        }
         var provided = false; var error: NSError?
         let result = converter.convert(to: output, error: &error) { _, state in
             if provided { state.pointee = .noDataNow; return nil }
-            provided = true; state.pointee = .haveData; return input
+            provided = true; state.pointee = .haveData; return conversionInput
         }
         guard result != .error else { throw error ?? OutputError.message("Audio conversion failed") as NSError }
         let buffer = UnsafeMutableAudioBufferListPointer(output.mutableAudioBufferList)[0]

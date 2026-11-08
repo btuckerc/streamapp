@@ -52,10 +52,7 @@ struct DesktopBackgroundRenderer {
     }
 
     private static func fittedContentRect(_ image: CIImage, in rect: CGRect) -> CGRect {
-        let e = image.extent
-        let scale = min(rect.width / e.width, rect.height / e.height)
-        let w = e.width * scale, h = e.height * scale
-        return CGRect(x: rect.minX + (rect.width - w) / 2, y: rect.minY + (rect.height - h) / 2, width: w, height: h)
+        CameraDisplayMapping.fitted(source: image.extent.size, in: rect)
     }
     private static func reflectedTile(_ image: CIImage, content: CGRect) -> CIImage {
         let base = image.transformed(by: CGAffineTransform(translationX: -content.minX, y: -content.minY))

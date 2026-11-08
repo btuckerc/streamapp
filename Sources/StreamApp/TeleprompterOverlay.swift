@@ -300,42 +300,68 @@ struct TeleprompterControls: View {
     }
     var body: some View {
         Form {
-            Section("Notch teleprompter") {
+            Section {
                 Picker("Mode", selection: mode) {
                     ForEach(TeleprompterMode.allCases) { Text($0.title).tag($0) }
                 }.pickerStyle(.segmented).accessibilityLabel("Teleprompter mode")
-                    .help("Shows below the display camera. Click the panel to collapse; the chevron beside the notch expands it.")
-                Toggle("Visible in stream and recording", isOn: $model.configuration.teleprompterInCapture)
-                    .accessibilityLabel("Teleprompter visible in stream and recording")
-                    .help("Off keeps it out of StreamApp capture, even with Show StreamApp windows on. Other recording apps can still see it.")
+                if model.configuration.teleprompterMode != .off {
+                    Toggle("Visible in stream and recording", isOn: $model.configuration.teleprompterInCapture)
+                        .accessibilityLabel("Teleprompter visible in stream and recording")
+                        .help("Off keeps it out of StreamApp capture, even with Show StreamApp windows on. Other recording apps can still see it.")
+                }
+            } header: {
+                Text("Notch teleprompter")
+            } footer: {
+                Text(modeCaption).font(.caption).foregroundStyle(.secondary)
             }
-            if model.configuration.teleprompterMode == .twitchChat {
+            switch model.configuration.teleprompterMode {
+            case .off:
+                EmptyView()
+            case .twitchChat:
                 Section("Twitch chat") {
                     LabeledContent("Channel", value: model.configuration.twitchChatChannel.isEmpty ? "Your account" : model.configuration.twitchChatChannel)
                         .help("Set in Chat")
                     Text(teleprompter.chatStatus).font(.caption).foregroundStyle(.secondary)
                 }
-            } else {
-                Section("Transcript") {
+            case .transcript:
+                Section {
                     HStack {
-                        Text(teleprompter.transcriptName.isEmpty ? "No transcript" : teleprompter.transcriptName).lineLimit(1)
+                        if teleprompter.transcriptName.isEmpty {
+                            Text("No script yet").foregroundStyle(.secondary)
+                        } else {
+                            Label(teleprompter.transcriptName, systemImage: "doc.text").lineLimit(1)
+                        }
                         Spacer()
+                        if !model.configuration.transcriptPath.isEmpty {
+                            Button("Reload") { model.reloadTranscript() }
+                        }
                         Button("Open…") { model.chooseTranscript() }
-                        Button("Reload") { model.reloadTranscript() }.disabled(model.configuration.transcriptPath.isEmpty)
                         Button("Save Template…") { model.saveTranscriptTemplate() }
-                            .help("Markdown with --- on its own line between cues")
                     }
-                    // An unset path already reads "No transcript"; only surface real load errors.
+                    // An unset path already reads "No script yet"; only surface real load errors.
                     if let error = teleprompter.error, !model.configuration.transcriptPath.isEmpty {
                         Text(error).font(.caption).foregroundStyle(.orange)
                     }
                     if teleprompter.pageCount > 0 {
                         pageControls.help("← and → change pages while the transcript is expanded")
                     }
+                } header: {
+                    Text("Script")
+                } footer: {
+                    Text("A Markdown file with --- on its own line between cues. Start from the template.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
             }
         }.formStyle(.grouped)
         .accessibilityElement(children: .contain)
+    }
+
+    private var modeCaption: String {
+        switch model.configuration.teleprompterMode {
+        case .off: "Choose Transcript to read a script, or Twitch chat to follow chat, just below the notch."
+        case .transcript: "Your script, one cue at a time. Click the panel to tuck it away; the chevron by the notch brings it back."
+        case .twitchChat: "Chat below the notch, readable while you look at the camera."
+        }
     }
 
     private var pageControls: some View {

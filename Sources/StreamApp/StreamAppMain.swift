@@ -22,6 +22,7 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
     private var settingsWindow: NSWindow?
     private var inspectionWindow: NSWindow?
     private var stateSubscription: AnyCancellable?
+    private var failureSubscription: AnyCancellable?
     private var popoverHost: NSHostingController<StudioPopover>?
     private var onboardingWindow: NSWindow?
     private var closingOnboarding = false
@@ -32,6 +33,7 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
     private var teleprompterSubscriptions = Set<AnyCancellable>()
     private var localPopoverMonitor: Any?
     private var globalPopoverMonitor: Any?
+    private var cameraArrange: CameraArrangeOverlay?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let arguments = CommandLine.arguments
@@ -47,6 +49,12 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
             self?.model.toggleAnnotations?()
         }
         shortcuts.onCameraPunchIn = { [weak self] in self?.model.toggleCameraPunchIn() }
+        shortcuts.onCameraArrange = { [weak self] in self?.model.toggleCameraArrange?() }
+        shortcuts.onSession = { [weak self] in self?.toggleSessionFromShortcut() }
+        shortcuts.onScene = { [weak self] layout in
+            guard let self, !self.model.busy else { return }
+            self.model.selectScene(layout)
+        }
         shortcuts.onTranscriptNext = { [weak self] in self?.model.teleprompter.nextPage() }
         shortcuts.onTranscriptPrevious = { [weak self] in self?.model.teleprompter.previousPage() }
         shortcuts.onRegistrationFailure = { [weak self] registration, _ in
@@ -54,6 +62,9 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
             switch registration {
             case .annotation: self.model.message = "Drawing shortcut is already in use. Use Annotate desktop from the menu."
             case .cameraPunchIn: self.model.message = "Webcam punch-in shortcut is already in use. Use Punch in from the menu."
+            case .cameraArrange: self.model.message = "Webcam arrangement shortcut is already in use. Use Arrange on Desktop in Settings → Scene → Position."
+            case .session: self.model.message = "Start/stop shortcut is already in use. Use Start in the menu."
+            case .scene: self.model.message = "A scene shortcut (⌃⌥⌘1–4) is already in use. Pick scenes in the menu."
             case .transcriptNext: self.model.message = "Right arrow is already in use. Use Next in Prompter settings."
             case .transcriptPrevious: self.model.message = "Left arrow is already in use. Use Previous in Prompter settings."
             }
@@ -93,8 +104,8 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
         model.engine.annotationWindowID = annotations.canvasWindowID
         annotations.onToggleRequested = { [weak self] _ in
             guard let self else { return false }
-            guard !model.busy, model.configuration.layout == .desktopChat, model.configuration.windowID == nil else {
-                model.message = "Annotations require Desktop with a display source, not a single window."
+            guard !model.busy, model.configuration.layout.showsDesktop, model.configuration.windowID == nil else {
+                model.message = "Annotations require Desktop or Split with a display source, not a single window."
                 return false
             }
             return true
@@ -116,9 +127,17 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
             annotations.toggle(on: model.configuration.displayID ?? CGMainDisplayID())
         }
         model.clearAnnotations = { [weak annotations] in annotations?.clear() }
+        let cameraArrange = CameraArrangeOverlay(model: model)
+        self.cameraArrange = cameraArrange
+        model.engine.cameraArrangeWindowID = cameraArrange.windowID
+        model.toggleCameraArrange = { [weak self, weak cameraArrange] in
+            guard let self, self.model.canArrangeCamera else { return }
+            self.popover.performClose(nil)
+            cameraArrange?.toggle()
+        }
 
         sceneSubscription = model.$configuration.sink { [weak annotations] c in
-            if c.layout != .desktopChat || c.windowID != nil { annotations?.stopDrawing(); annotations?.clear() }
+            if !c.layout.showsDesktop || c.windowID != nil { annotations?.stopDrawing(); annotations?.clear() }
         }
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.autosaveName = "StreamApp.Studio"
@@ -138,6 +157,14 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
             self?.item.button?.image = running ? StudioMark.recording : StudioMark.idle
             self?.item.button?.toolTip = running ? "StreamApp — Session active" : "StreamApp — Idle"
         }
+        // A session that ends or fails to start with an error says so even if the menu is closed.
+        failureSubscription = Publishers.CombineLatest(model.engine.$isRunning, model.engine.$errorMessage)
+            .map { running, error in running ? nil : error }
+            .removeDuplicates()
+            .sink { [weak self] error in
+                guard error != nil else { return }
+                DispatchQueue.main.async { self?.showPopover(activate: false) }
+            }
         if arguments.contains("--ui-smoke") || arguments.contains("--settings-smoke") {
             let window: NSWindow
             if arguments.contains("--settings-smoke") {
@@ -195,10 +222,37 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
     }
 
     @objc private func togglePopover() {
-        if popover.isShown { popover.performClose(nil) }
-        else if let button = item.button {
-            NSApplication.shared.activate(ignoringOtherApps: true)
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        if popover.isShown { popover.performClose(nil) } else { showPopover() }
+    }
+
+    /// `activate: false` shows the menu without taking keyboard focus from the user's app.
+    private func showPopover(activate: Bool = true) {
+        guard !popover.isShown, let button = item?.button else { return }
+        if activate { NSApplication.shared.activate(ignoringOtherApps: true) }
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+    }
+
+    /// ⌃⌥⌘R. Runs after the Carbon handler returns. The broadcast confirmation is app-modal,
+    /// so StreamApp comes forward for it and hands focus back afterwards. Ignored while any
+    /// StreamApp dialog is open. A start that cannot begin opens the menu to say why.
+    private func toggleSessionFromShortcut() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let model, NSApp.modalWindow == nil else { return }
+            let starting = !model.busy && !model.engine.isRunning
+            let confirming = starting && model.configuration.streamingEnabled
+            let previous = NSWorkspace.shared.frontmostApplication
+            if confirming { NSApplication.shared.activate(ignoringOtherApps: true) }
+            var openedSetup = false
+            model.toggleSession(openStreamingSetup: { [weak self] in openedSetup = true; self?.showOnboarding(streamingOnly: true) })
+            guard starting, !openedSetup else { return }
+            if confirming, let previous, previous != NSRunningApplication.current { previous.activate() }
+            if let task = model.startTask {
+                Task { [weak self] in
+                    await task.value
+                    guard let self, !model.engine.isRunning, model.message != nil else { return }
+                    self.showPopover(activate: false)
+                }
+            } else if model.message != nil { showPopover(activate: false) }
         }
     }
 
@@ -345,6 +399,7 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
         alert.addButton(withTitle: "Stop and Quit"); alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
         popover.performClose(nil)
+        model.cancelStart()
         Task {
             while model.busy { try? await Task.sleep(for: .milliseconds(50)) }
             await model.engine.setMenuPreview(visible: false, configuration: model.configuration, synthetic: model.demo)
@@ -372,6 +427,7 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
             }
             var c = StudioConfiguration()
             c.recordingDirectory = directory.path
+            c.privacyShieldEnabled = arguments.contains("--privacy-shield")
             c.cameraEnabled = true; c.microphoneEnabled = true; c.systemAudioEnabled = true
             if let i = arguments.firstIndex(of: "--smoke-rtmp"), arguments.indices.contains(i + 1) {
                 let endpoint = arguments[i + 1]
@@ -380,11 +436,13 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
             }
             model.engine.previewFrames.request(.program)
             try await model.engine.start(configuration: c, streamKey: "", synthetic: true)
-            for stage in 0..<5 {
+            for stage in 0..<7 {
                 if stage == 1 { c.layout = .justChatting; c.chatEnabled = false }
                 if stage == 2 { c.cameraEnabled = false; c.microphoneMuted = true; c.chatEnabled = true }
-                if stage == 3 { c.layout = .desktopChat; c.cameraEnabled = true; c.cameraFrame = .circle; c.chatEnabled = false; c.chatOnLeft = true; c.cameraCorner = .topLeft; c.microphoneMuted = false; c.systemAudioGain = 0.5 }
+                if stage == 3 { c.layout = .desktopChat; c.cameraEnabled = true; c.cameraFrame = .circle; c.chatEnabled = false; c.chatOnLeft = true; c.cameraAnchor = CameraAnchor(x: 0, y: 0); c.microphoneMuted = false; c.systemAudioGain = 0.5 }
                 if stage == 4 { c.cameraPunchIn = true }
+                if stage == 5 { c.layout = .sideBySide; c.cameraPunchIn = false; c.cameraFrame = .widescreen; c.chatEnabled = true; c.chatOnLeft = false; c.cameraBorder = .thin }
+                if stage == 6 { c.layout = .away }
                 try await model.engine.update(configuration: c)
                 try await Task.sleep(for: .seconds(stageSeconds))
                 guard model.engine.isRunning, model.engine.errorMessage == nil else { throw SmokeError.message(model.engine.errorMessage ?? "Session stopped") }
@@ -402,7 +460,7 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
             try await Task.sleep(for: .seconds(3))
             await model.engine.stop()
             if let error = model.engine.errorMessage { throw SmokeError.message(error) }
-            print("SMOKE PASS: live scenes, chat toggle, camera toggle, audio controls, clean stop and restart")
+            print("SMOKE PASS: live scenes (Desktop, Full Camera, Split, Away), chat toggle, camera toggle, audio controls, clean stop and restart")
             fflush(stdout)
             NSApplication.shared.terminate(nil)
         } catch {
@@ -454,6 +512,7 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
             c.microphoneEnabled = arguments.contains("--bench-microphone")
             c.systemAudioEnabled = !arguments.contains("--bench-no-system-audio")
             c.recordingDirectory = directory.path
+            c.privacyShieldEnabled = arguments.contains("--privacy-shield")
             c.recordingEnabled = !arguments.contains("--bench-no-record")
             var key = ""
             if let endpoint = value("--bench-rtmp") {
@@ -476,7 +535,8 @@ final class StudioApplication: NSObject, NSApplicationDelegate, NSPopoverDelegat
             await model.engine.stop()
             event("stopped", [
                 "frames": health?.frames ?? 0, "media_seconds": health?.mediaSeconds ?? 0,
-                "recording": model.engine.lastRecordingURL?.path ?? NSNull(),
+                "health": health?.summary ?? NSNull(),
+                "recording": model.engine.lastRecording?.url.path ?? NSNull(),
                 "error": model.engine.errorMessage ?? NSNull(),
             ])
             if let error = model.engine.errorMessage { throw SmokeError.message(error) }

@@ -3,8 +3,8 @@ import WebKit
 
 @MainActor
 final class Chat: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
-    private let width: CGFloat
-    private static let height: CGFloat = 1080
+    /// Output pixel size: the chat's slot in the current scene (`SceneGeometry.chatSize`).
+    private var size: CGSize
 
     let webView: WKWebView
     var error: Error?
@@ -44,16 +44,16 @@ final class Chat: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
 
     private var messageProxy: WeakMessageProxy!
 
-    init(onImage: @escaping (CGImage) -> Void, channel: String, width: Int = 384, appearance: ChatAppearance, onStatus: @escaping (String) -> Void = { _ in }, onTranscript: ((String) -> Void)? = nil, onEmoteStatus: ((String) -> Void)? = nil) {
+    init(onImage: @escaping (CGImage) -> Void, channel: String, size: CGSize, appearance: ChatAppearance, onStatus: @escaping (String) -> Void = { _ in }, onTranscript: ((String) -> Void)? = nil, onEmoteStatus: ((String) -> Void)? = nil) {
         self.onImage = onImage
         self.onStatus = onStatus
         self.onTranscript = onTranscript
         self.onEmoteStatus = onEmoteStatus
         self.appearance = appearance
-        self.width = CGFloat(width)
+        self.size = size
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .nonPersistent()
-        self.webView = WKWebView(frame: NSRect(x: 0, y: 0, width: width, height: Int(Self.height)), configuration: configuration)
+        self.webView = WKWebView(frame: NSRect(origin: .zero, size: size), configuration: configuration)
         super.init()
         messageProxy = WeakMessageProxy(self)
         webView.navigationDelegate = self
@@ -116,6 +116,20 @@ final class Chat: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
         appearanceDirty = true
         if emotesChanged { loadEmotes() }
         scheduleRender()
+    }
+
+    /// Lays the page out again at a new slot size. Text keeps its pixel size; lines rewrap and the
+    /// newest messages stay at the bottom. The renderer hands over from the previous page as the
+    /// scene moves, so calling this before a scene change commits is what keeps that seamless.
+    func resize(to next: CGSize) {
+        guard !stopped, next != size, next.width >= 1, next.height >= 1 else { return }
+        size = next
+        webView.setFrameSize(next)
+        // Snapshot only after the page has relaid out and scrolled its newest message into view
+        // at the new size; a snapshot taken first would show the old scroll position.
+        webView.evaluateJavaScript("settle()") { [weak self] _, _ in
+            Task { @MainActor [weak self] in self?.markDirty() }
+        }
     }
 
     private func loadEmotes() {
@@ -184,7 +198,7 @@ final class Chat: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
         // The first image establishes the actual NSImage backing scale. WKWebView
         // takes this value in logical points; output uses the configured pixel width.
         if let scale = imageScale, scale > 0 {
-            settings.snapshotWidth = NSNumber(value: Double(width) / scale)
+            settings.snapshotWidth = NSNumber(value: Double(size.width) / scale)
         }
         webView.takeSnapshot(with: settings) { [weak self] image, snapshotError in
             Task { @MainActor [weak self] in
@@ -203,9 +217,10 @@ final class Chat: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
                 if image.size.width > 0 {
                     self.imageScale = Double(cgImage.width) / Double(image.size.width)
                 }
-                // Do not publish the scale-discovery frame: callers always receive
-                // the configured width × 1080 pixel image.
-                guard cgImage.width == Int(self.width), cgImage.height == Int(Self.height) else {
+                // Do not publish the scale-discovery frame, or one laid out before a resize: callers
+                // always receive an image of the current slot size. WebKit sizes the snapshot in
+                // points, so an odd slot height on a 2× display can come back one pixel short or long.
+                guard cgImage.width == Int(self.size.width), abs(cgImage.height - Int(self.size.height)) <= 1 else {
                     self.dirty = true
                     self.scheduleSnapshot()
                     return

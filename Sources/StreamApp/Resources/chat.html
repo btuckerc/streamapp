@@ -10,13 +10,14 @@
 :root { --size: 24px; --background: #10151c; --text: #f1f5f9; --muted: #bdc9d8; --accent: #8ae6bd; }
 html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: transparent; }
 body { color: var(--text); font: var(--size)/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-.chat { height: 100%; display: flex; flex-direction: column; background: var(--background); border-inline-start: 1px solid #526174; }
+.chat { height: 100%; display: flex; flex-direction: column; background: var(--background); }
 .head, .footer { flex: none; padding: 16px; overflow-wrap: anywhere; }
 .head { border-bottom: 1px solid #526174; font-size: max(20px, .85em); font-weight: 600; }
 .prompt { color: var(--accent); }
-.messages { flex: 1; min-height: 0; overflow: hidden; padding: 16px; }
+.messages { flex: 1; min-height: 0; overflow: hidden; padding: 16px; position: relative; }
 .history { min-height: 100%; display: flex; flex-direction: column; justify-content: flex-end; gap: 14px; }
 .message { flex: none; overflow-wrap: anywhere; white-space: pre-wrap; unicode-bidi: plaintext; }
+.message.clamped { display: -webkit-box; -webkit-box-orient: vertical; overflow: hidden; }
 .name { font-weight: 700; }
 .body { color: var(--text); }
 .command, .mention { color: var(--accent); font-weight: 600; }
@@ -60,9 +61,10 @@ function nameColor(value) {
   const key = value.toLowerCase();
   if (colors.has(key)) return colors.get(key);
   const rgb = [1, 3, 5].map(i => parseInt(key.slice(i, i + 2), 16));
-  // Translucency is fixed at 90%. White behind it is the worst-case background.
+  // Translucency is fixed at 90%. White behind it is the worst-case background. Names need 7:1
+  // (WCAG AAA), not 4.5:1: stream video halves colour resolution, so luminance carries the letters.
   const background = options.solidBackground ? [16, 21, 28] : [40, 45, 51];
-  const minimum = 4.5 * (luminance(background) + .05) - .05;
+  const minimum = 7 * (luminance(background) + .05) - .05;
   let result = key;
   if (luminance(rgb) < minimum) {
     let low = 0, high = 1;
@@ -192,7 +194,25 @@ function settle() {
   if (!entries.size && !document.getElementById('empty')) {
     const empty = document.createElement('p'); empty.id = 'empty'; empty.className = 'empty'; empty.textContent = 'Waiting for chat…'; history.append(empty);
   }
+  // Styles change only when they differ, so settling an unchanged page re-renders nothing.
+  const box = getComputedStyle(viewport);
+  const room = viewport.clientHeight - parseFloat(box.paddingTop) - parseFloat(box.paddingBottom);
+  const newest = history.lastElementChild;
+  for (const node of history.children) {
+    // The newest message always shows; one taller than the panel keeps its opening lines and ends
+    // in "…" (scrollHeight is the full message even while clamped).
+    const style = getComputedStyle(node);
+    const lineHeight = parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.5;
+    const lines = node === newest && node.scrollHeight > room ? String(Math.max(1, Math.floor(room / lineHeight))) : '';
+    if (node.style.webkitLineClamp !== lines) { node.style.webkitLineClamp = lines; node.classList.toggle('clamped', lines !== ''); }
+  }
   viewport.scrollTop = viewport.scrollHeight;
+  // Otherwise only whole messages: a line cut off under the heading is unreadable on video.
+  const top = viewport.scrollTop + parseFloat(box.paddingTop);
+  for (const node of history.children) {
+    const visibility = node !== newest && node.offsetTop < top ? 'hidden' : '';
+    if (node.style.visibility !== visibility) node.style.visibility = visibility;
+  }
 }
 
 function rebuildMessages() {
@@ -266,6 +286,8 @@ window.applyChatEvents = events => {
 };
 // A native, selectable text alternative; no HTML or bot-generated response markup.
 window.chatTranscript = () => Array.from(entries.values(), ({message: m}) => '<' + (m.displayName || m.login || 'viewer') + '> ' + m.text + (m.sourceChannel && m.sourceChannel !== channel ? ' (#' + m.sourceChannel + ')' : '')).join('\n\n');
+// A resize (the chat moving to another scene's slot) relays the page out; keep the newest messages in view.
+addEventListener('resize', settle, {passive: true});
 settle();
 </script>
 </body>

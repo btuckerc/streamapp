@@ -33,12 +33,23 @@ final class StudioModel: ObservableObject {
             // Bindings often write back an unchanged value; don't save or reconfigure capture then.
             guard configuration != oldValue else { return }
             if configuration.streamService != oldValue.streamService { message = nil }
+            if configuration.cameraEnabled, message?.hasPrefix(Self.webcamNudge) == true { message = nil }
+            if configuration.microphoneID != oldValue.microphoneID {
+                validateMicrophoneChannels()
+            }
+            if configuration.microphoneEnabled { loadDevices() }
+            if configuration.layout.usesCamera && !configuration.cameraEnabled {
+                configuration.awayCoversWebcam = configuration.layout.withoutCamera == .away
+                configuration.layout = configuration.layout.withoutCamera
+            } else if configuration.awayCoversWebcam && configuration.layout != .away {
+                configuration.awayCoversWebcam = false
+            }
             if (!configuration.cameraEnabled || configuration.layout != .desktopChat) && configuration.cameraPunchIn {
                 configuration.cameraPunchIn = false
             }
             dockFit.configure(configuration)
-            if configuration.backgroundImagePath != oldValue.backgroundImagePath {
-                refreshBackgroundImageState()
+            for slot in ImageSlot.allCases where configuration[keyPath: slot.path] != oldValue[keyPath: slot.path] {
+                refreshImageState(slot)
             }
             if configuration.teleprompterMode != oldValue.teleprompterMode ||
                 configuration.teleprompterInCapture != oldValue.teleprompterInCapture {
@@ -52,7 +63,33 @@ final class StudioModel: ObservableObject {
     @Published var sources: [CaptureSource] = []
     @Published var cameras: [DeviceOption] = []
     @Published var microphones: [DeviceOption] = []
+    var selectedMicrophone: DeviceOption? {
+        if !configuration.microphoneID.isEmpty { return microphones.first { $0.id == configuration.microphoneID } }
+        if let id = engine.resolvedMicrophoneID { return microphones.first { $0.id == id } }
+        return microphones.first(where: \.isDefaultInput)
+    }
+    var microphoneRouteWarning: String? {
+        configuration.microphoneEnabled && selectedMicrophone?.bluetooth == true ?
+            "Bluetooth microphone selected. Playback quality may drop. Disable or reselect the mic to release it; muting does not." : nil
+    }
+    private func validateMicrophoneChannels() {
+        guard let device = selectedMicrophone, device.inputChannels > 0 else { return }
+        configuration.microphoneChannels = configuration.microphoneChannels.validated(channelCount: device.inputChannels)
+    }
     @Published var busy = false
+    /// What a session start or stop is waiting on, for the session button.
+    enum SessionStage: Equatable {
+        case streamKey, starting, stopping(recording: Bool)
+        var title: String {
+            switch self {
+            case .streamKey: "Getting key…"
+            case .starting: "Starting…"
+            case .stopping(let recording): recording ? "Saving…" : "Stopping…"
+            }
+        }
+    }
+    @Published private(set) var sessionStage: SessionStage?
+    private(set) var startTask: Task<Void, Never>?
     @Published var message: String?
     @Published var streamKey = ""
     @Published var keySaved = false
@@ -61,10 +98,19 @@ final class StudioModel: ObservableObject {
     /// Stored independently from the Codable broadcast settings for safe schema evolution.
     @Published private(set) var onboardingCompleted: Bool
     let demo: Bool
-    @Published private(set) var backgroundImageAvailable = false
-    @Published private(set) var backgroundImageError: String?
-    @Published private(set) var importingBackgroundImage = false
-    private var backgroundImportGeneration = 0
+    /// Pictures the user imports: the scene background and the Away card's backdrop.
+    enum ImageSlot: CaseIterable {
+        case background, away
+        var path: WritableKeyPath<StudioConfiguration, String> {
+            switch self { case .background: \.backgroundImagePath; case .away: \.awayImagePath }
+        }
+        var missing: String {
+            switch self { case .background: "Image unavailable; using the fallback color."; case .away: "Image unavailable; using Dark." }
+        }
+    }
+    @Published private(set) var imageErrors: [ImageSlot: String] = [:]
+    @Published private(set) var importingImages: Set<ImageSlot> = []
+    private var imageImportGeneration: [ImageSlot: Int] = [:]
     func access(_ permission: CapturePermission) -> CaptureAccess { captureAccess[permission] ?? .notDetermined }
     /// Permissions the current configuration needs but lacks.
     var captureAccessIssues: [CapturePermission] {
@@ -72,7 +118,7 @@ final class StudioModel: ObservableObject {
         let c = configuration
         return CapturePermission.allCases.filter { permission in
             let needed: Bool = switch permission {
-            case .screen: c.layout == .desktopChat || c.systemAudioEnabled
+            case .screen: c.layout.showsDesktop || c.systemAudioEnabled
             case .camera: c.cameraEnabled
             case .microphone: c.microphoneEnabled
             }
@@ -83,6 +129,17 @@ final class StudioModel: ObservableObject {
     var clearAnnotations: (() -> Void)?
     var hideTeleprompter: (() -> Void)?
     var updateTeleprompter: ((StudioConfiguration) -> Void)?
+    var toggleCameraArrange: (() -> Void)?
+    var canArrangeCamera: Bool {
+        configuration.cameraEnabled && configuration.layout == .desktopChat && configuration.windowID == nil && !busy
+    }
+    func commitCameraDrag(_ anchor: CameraAnchor) {
+        engine.finishCameraDrag(committing: anchor)
+        let unchanged = configuration.cameraAnchor == anchor
+        configuration.cameraAnchor = anchor
+        // An unchanged release still acknowledges the override through configure.
+        if unchanged { scheduleUpdate() }
+    }
     @Published var choosingTranscript = false
 
     var canPunchInCamera: Bool {
@@ -100,6 +157,7 @@ final class StudioModel: ObservableObject {
     private var dockRegionSubscription: AnyCancellable?
     private var twitchSubscription: AnyCancellable?
     private var deviceSubscription: AnyCancellable?
+    private var audioRouteObserver: AudioInputRouteObserver?
     private var devicesLoaded = false
     private var deviceGeneration = 0
     private var pendingUpdate = false
@@ -131,7 +189,7 @@ final class StudioModel: ObservableObject {
             self.configuration.dockFitRegion = region
         }
         if demo { configuration.recordingDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("StreamApp-Demo").path }
-        refreshBackgroundImageState()
+        for slot in ImageSlot.allCases { refreshImageState(slot) }
         teleprompter.configure(configuration)
         loading = false
         // Device enumeration is non-capturing and deferred to the views that list devices
@@ -149,6 +207,7 @@ final class StudioModel: ObservableObject {
             self.stop()
         }
         if !demo { Task { await twitch.restore() } }
+        if !demo && configuration.microphoneEnabled { loadDevices() }
     }
 
     func completeOnboarding() {
@@ -217,6 +276,8 @@ final class StudioModel: ObservableObject {
     private func scheduleUpdate() {
         guard !loading, !busy else { return }
         pendingUpdate = true
+        // Hiding reaches the renderer now, not after an update still applying an older change.
+        engine.request(configuration)
         guard updateTask == nil else { return }
         updateTask = Task { [weak self] in
             guard let self else { return }
@@ -261,7 +322,7 @@ final class StudioModel: ObservableObject {
         if current != captureAccess { captureAccess = current }
     }
 
-    /// Only Settings and setup list devices; the first one shown enumerates them off the main thread.
+    /// Settings/setup and an enabled mic need non-capturing route metadata.
     func loadDevices() {
         guard !devicesLoaded else { return }
         devicesLoaded = true
@@ -272,6 +333,11 @@ final class StudioModel: ObservableObject {
         guard devicesLoaded else { return }
         deviceGeneration &+= 1
         let generation = deviceGeneration
+        if !demo {
+            audioRouteObserver = AudioInputRouteObserver { [weak self] in
+                Task { @MainActor in self?.refreshDevices() }
+            }
+        }
         Task.detached(priority: .userInitiated) { [weak self] in
             let cameras = StudioEngine.cameras(), microphones = StudioEngine.microphones()
             await self?.applyDevices(cameras: cameras, microphones: microphones, generation: generation)
@@ -282,6 +348,7 @@ final class StudioModel: ObservableObject {
         guard deviceGeneration == generation else { return }  // a newer refresh supersedes this one
         if self.cameras != cameras { self.cameras = cameras }
         if self.microphones != microphones { self.microphones = microphones }
+        validateMicrophoneChannels()
     }
 
     func refreshSources() {
@@ -300,17 +367,46 @@ final class StudioModel: ObservableObject {
             get: { [weak self] in self?.configuration[keyPath: key] ?? false },
             set: { [weak self] on in
                 guard let self else { return }
-                guard on, !demo else { configuration[keyPath: key] = on; return }
-                switch access(permission) {
-                case .allowed: configuration[keyPath: key] = true
-                case .notDetermined:
-                    Task { [weak self] in
-                        guard let self, await promptForAccess(permission) else { return }
-                        configuration[keyPath: key] = true
-                    }
-                case .denied, .restricted: presentAccessAlert(permission)
-                }
+                if on { enable(permission) } else { configuration[keyPath: key] = false }
             })
+    }
+
+    /// Turns a source on, asking for access in context; `alongside` lands in the same change
+    /// once access allows, and not at all if it is refused.
+    func enable(_ permission: CapturePermission, alongside change: ((inout StudioConfiguration) -> Void)? = nil) {
+        let key = permission.configurationKey
+        let apply = { [weak self] in
+            guard let self else { return }
+            var next = configuration
+            next[keyPath: key] = true
+            change?(&next)
+            configuration = next
+        }
+        guard !demo else { apply(); return }
+        switch access(permission) {
+        case .allowed: apply()
+        case .notDetermined:
+            Task { [weak self] in
+                guard let self, await promptForAccess(permission) else { return }
+                apply()
+            }
+        case .denied, .restricted: presentAccessAlert(permission)
+        }
+    }
+
+    func canSelectScene(_ layout: SceneLayout) -> Bool {
+        !layout.usesCamera || configuration.cameraEnabled
+    }
+    private static let webcamNudge = "Turn on the webcam to use"
+    func selectScene(_ layout: SceneLayout) {
+        guard canSelectScene(layout) else {
+            NSSound.beep()
+            message = "\(Self.webcamNudge) \(layout.title)."
+            return
+        }
+        configuration.layout = layout
+        configuration.awayCoversWebcam = false
+        if message?.hasPrefix(Self.webcamNudge) == true { message = nil }
     }
 
     /// Explicit button: prompt once, afterwards send the user to the Privacy pane.
@@ -378,36 +474,42 @@ final class StudioModel: ObservableObject {
         guard !dockFit.busy else { message = "Wait for the Dock adjustment to finish."; return }
         message = nil
         if !demo {
-            if configuration.layout == .desktopChat && configuration.displayID == nil && configuration.windowID == nil {
+            if configuration.layout.showsDesktop && configuration.displayID == nil && configuration.windowID == nil {
                 message = "Choose a display or window first."; return
             }
             if configuration.cameraEnabled && access(.camera) != .allowed { message = "Camera access is off."; return }
             if configuration.microphoneEnabled && access(.microphone) != .allowed { message = "Microphone access is off."; return }
         }
+        let approvedAccountID = twitch.account?.id
+        var prefetchedKey: Task<String, Error>?
         if configuration.streamingEnabled {
-            let mode = configuration.twitchTestMode ? "Twitch bandwidth test (not viewable live)" : "live broadcast"
+            let mode = configuration.twitchTestMode ? "Test stream (not public)" : "Live broadcast"
             let host = configuration.streamService == .twitch
                 ? "Twitch @\(twitch.account?.login ?? "")"
                 : URL(string: configuration.streamURL)?.host ?? "the configured server"
             guard validateStreamSetup() else { return }
+            // Fetch the Twitch key while the confirmation is open; Cancel discards it.
+            if configuration.streamService == .twitch { prefetchedKey = Task { try await twitch.streamKey() } }
             let alert = NSAlert()
-            alert.messageText = configuration.twitchTestMode ? "Start Twitch bandwidth test?" : "Start broadcasting?"
-            alert.informativeText = "\(mode.capitalized) to \(host). Recording: \(configuration.recordingEnabled ? "on" : "off"). Your stream key is kept private."
-            alert.addButton(withTitle: configuration.twitchTestMode ? "Start Bandwidth Test" : "Start Broadcast"); alert.addButton(withTitle: "Cancel")
-            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            alert.messageText = configuration.twitchTestMode ? "Start test stream?" : "Start broadcasting?"
+            alert.informativeText = "\(mode) to \(host). Recording: \(configuration.recordingEnabled ? "on" : "off"). Your stream key is kept private."
+            alert.addButton(withTitle: configuration.twitchTestMode ? "Start Test Stream" : "Start Broadcast"); alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn, !busy, !engine.isRunning else { prefetchedKey?.cancel(); return }
         }
-        let approvedAccountID = twitch.account?.id
         let requestedConfiguration = configuration
         busy = true
-        Task {
-            defer { busy = false }
+        sessionStage = prefetchedKey == nil ? .starting : .streamKey
+        startTask = Task {
+            // cancelStart() has already returned the model to idle for a cancelled start.
+            defer { if !Task.isCancelled { busy = false; sessionStage = nil; startTask = nil } }
             do {
                 var outputConfiguration = requestedConfiguration
                 let key: String
                 if !outputConfiguration.streamingEnabled {
                     key = ""
-                } else if outputConfiguration.streamService == .twitch {
-                    key = try await twitch.streamKey()
+                } else if let prefetchedKey {
+                    key = try await withTaskCancellationHandler { try await prefetchedKey.value } onCancel: { prefetchedKey.cancel() }
+                    try Task.checkCancellation()
                     guard twitch.account?.id == approvedAccountID else {
                         message = "Twitch account changed. Review the destination and start again."
                         return
@@ -416,21 +518,40 @@ final class StudioModel: ObservableObject {
                 } else {
                     key = streamKey.isEmpty && !demo ? try StreamCredential.load() : streamKey
                 }
+                sessionStage = .starting
                 try await engine.start(configuration: outputConfiguration, streamKey: key, synthetic: demo)
                 if outputConfiguration.streamingEnabled, outputConfiguration.streamService == .twitch,
                    twitch.account?.id != approvedAccountID {
                     await engine.stop()
                     message = "Twitch account changed. Review the destination and start again."
                 }
-            } catch { message = error.localizedDescription }
+            } catch { if !Task.isCancelled { message = error.localizedDescription } }
         }
+    }
+
+    /// Cancels a start that is still fetching its stream key; capture has not begun then.
+    /// Returns to idle at once: the key request may be waiting on a shared Twitch token
+    /// refresh that does not observe cancellation.
+    func cancelStart() {
+        guard sessionStage == .streamKey, let startTask else { return }
+        startTask.cancel()
+        self.startTask = nil; busy = false; sessionStage = nil
+    }
+
+    /// The session button and ⌃⌥⌘R: Cancel while fetching the key, else Stop or Start.
+    func toggleSession(openStreamingSetup: () -> Void) {
+        if sessionStage == .streamKey { cancelStart() }
+        else if engine.isRunning { stop() }
+        else if configuration.streamingEnabled && !validateStreamSetup() { openStreamingSetup() }
+        else { start() }
     }
 
     func stop() {
         guard !busy else { return }
         if rehearsalActive { stopRehearsal(); return }
         busy = true
-        Task { await updateTask?.value; await engine.stop(); busy = false }
+        sessionStage = .stopping(recording: configuration.recordingEnabled)
+        Task { await updateTask?.value; await engine.stop(); busy = false; sessionStage = nil }
     }
 
     /// Restores persisted preferences while leaving credentials, recordings, onboarding,
@@ -454,7 +575,7 @@ final class StudioModel: ObservableObject {
         }
 
         await updateTask?.value
-        removeBackgroundImage()
+        for slot in ImageSlot.allCases { removeImage(slot) }
         configuration = StudioConfiguration()
         annotationSettings.restoreDefaults()
         message = nil
@@ -500,24 +621,18 @@ final class StudioModel: ObservableObject {
             teleprompter.reloadTranscript()
         } catch { message = "Could not save transcript template: \(error.localizedDescription)" }
     }
-    var backgroundImageFilename: String? {
-        guard !configuration.backgroundImagePath.isEmpty else { return nil }
-        return URL(fileURLWithPath: configuration.backgroundImagePath).lastPathComponent
+    func imageFilename(_ slot: ImageSlot) -> String? {
+        let path = configuration[keyPath: slot.path]
+        return path.isEmpty ? nil : URL(fileURLWithPath: path).lastPathComponent
     }
 
-    func refreshBackgroundImageState() {
-        guard !configuration.backgroundImagePath.isEmpty else {
-            backgroundImageAvailable = false
-            backgroundImageError = nil
-            return
-        }
-        let url = URL(fileURLWithPath: configuration.backgroundImagePath)
-        backgroundImageAvailable = FileManager.default.fileExists(atPath: url.path)
-        backgroundImageError = backgroundImageAvailable ? nil : "Image unavailable; using the fallback color."
+    func refreshImageState(_ slot: ImageSlot) {
+        let path = configuration[keyPath: slot.path]
+        imageErrors[slot] = path.isEmpty || FileManager.default.fileExists(atPath: path) ? nil : slot.missing
     }
 
-    func chooseBackgroundImage() {
-        guard !importingBackgroundImage else { return }
+    func chooseImage(_ slot: ImageSlot) {
+        guard !importingImages.contains(slot) else { return }
         let panel = NSOpenPanel()
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
@@ -525,10 +640,10 @@ final class StudioModel: ObservableObject {
         panel.allowsMultipleSelection = false
         panel.prompt = "Choose Image"
         guard panel.runModal() == .OK, let source = panel.url else { return }
-        backgroundImportGeneration += 1
-        let generation = backgroundImportGeneration
-        importingBackgroundImage = true
-        backgroundImageError = nil
+        let generation = (imageImportGeneration[slot] ?? 0) + 1
+        imageImportGeneration[slot] = generation
+        importingImages.insert(slot)
+        imageErrors[slot] = nil
         let destination = demo
             ? FileManager.default.temporaryDirectory.appendingPathComponent("StreamApp-Demo/Backgrounds", isDirectory: true)
             : FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -538,21 +653,21 @@ final class StudioModel: ObservableObject {
                 let imported = try await Task.detached(priority: .userInitiated) {
                     try importBackgroundImage(source: source, into: destination)
                 }.value
-                guard let self, self.backgroundImportGeneration == generation else { return }
-                self.importingBackgroundImage = false
-                self.configuration.backgroundImagePath = imported.path
+                guard let self, self.imageImportGeneration[slot] == generation else { return }
+                self.importingImages.remove(slot)
+                self.configuration[keyPath: slot.path] = imported.path
             } catch {
-                guard let self, self.backgroundImportGeneration == generation else { return }
-                self.importingBackgroundImage = false
-                self.backgroundImageError = "Could not import that image."
+                guard let self, self.imageImportGeneration[slot] == generation else { return }
+                self.importingImages.remove(slot)
+                self.imageErrors[slot] = "Could not import that image."
             }
         }
     }
 
-    func removeBackgroundImage() {
-        backgroundImportGeneration += 1
-        importingBackgroundImage = false
-        configuration.backgroundImagePath = ""
+    func removeImage(_ slot: ImageSlot) {
+        imageImportGeneration[slot, default: 0] += 1
+        importingImages.remove(slot)
+        configuration[keyPath: slot.path] = ""
     }
 }
 

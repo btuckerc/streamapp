@@ -88,11 +88,11 @@ struct StudioOnboarding: View {
     private var prepare: some View {
         VStack(alignment: .leading, spacing: 16) {
             intro("Prepare your scene", "Pick a layout and the devices you want. Camera, microphone, Twitch, and screen capture are all optional.")
-            Picker("Scene", selection: $model.configuration.layout) {
-                ForEach(SceneLayout.allCases) { Text($0.title).tag($0) }
+            Picker("Scene", selection: Binding(get: { model.configuration.layout }, set: { model.selectScene($0) })) {
+                ForEach(SceneLayout.allCases) { Text($0.title).tag($0).selectionDisabled(!model.canSelectScene($0)) }
             }.pickerStyle(.segmented)
             scenePreview
-            if model.configuration.layout == .desktopChat {
+            if model.configuration.layout.showsDesktop {
                 sourcePicker
             }
             Toggle(isOn: model.enabledBinding(for: .camera)) { Label("Camera", systemImage: "video") }
@@ -152,7 +152,7 @@ struct StudioOnboarding: View {
             } else {
                 streamConnectionFields
             }
-            Toggle("Twitch bandwidth test", isOn: $model.configuration.twitchTestMode)
+            Toggle("Test stream (not public)", isOn: $model.configuration.twitchTestMode)
             Text("Return to the menu and press Start when ready.").font(.caption).foregroundStyle(.secondary)
             if let message = model.message {
                 Text(message).font(.caption).foregroundStyle(.orange)
@@ -174,8 +174,10 @@ struct StudioOnboarding: View {
 
     private var tryIt: some View {
         VStack(alignment: .leading, spacing: 14) {
-            intro("Try it locally", "Rehearsal uses selected sources and records locally. It cannot broadcast.")
-            Picker("Scene", selection: $model.configuration.layout) { ForEach(SceneLayout.allCases) { Text($0.title).tag($0) } }.pickerStyle(.segmented).disabled(model.busy)
+            intro("Try it locally", "Rehearsal records your selected sources to this Mac. Nothing is sent online.")
+            Picker("Scene", selection: Binding(get: { model.configuration.layout }, set: { model.selectScene($0) })) {
+                ForEach(SceneLayout.allCases) { Text($0.title).tag($0).selectionDisabled(!model.canSelectScene($0)) }
+            }.pickerStyle(.segmented).disabled(model.busy)
             HStack {
                 Toggle(isOn: model.enabledBinding(for: .camera)) { Label("Camera", systemImage: "video") }.disabled(model.busy)
                 Toggle(isOn: model.enabledBinding(for: .microphone)) { Label("Microphone", systemImage: "mic") }.disabled(model.busy)
@@ -195,25 +197,27 @@ struct StudioOnboarding: View {
             Button {
                 model.rehearsalActive ? model.stopRehearsal() : model.startRehearsal()
             } label: {
-                Text(model.rehearsalActive ? "Stop preview" : "Start local preview").frame(width: 140)
+                Text(model.rehearsalActive ? "Stop Rehearsal" : "Start Rehearsal").frame(width: 140)
             }.buttonStyle(.bordered).disabled(model.busy)
             if engine.isRunning {
                 GPUPreview(frames: engine.previewFrames).aspectRatio(16 / 9, contentMode: .fit)
-                    .clipShape(RoundedRectangle(cornerRadius: 8)).accessibilityLabel("Live scene preview")
+                    .clipShape(RoundedRectangle(cornerRadius: 8)).accessibilityLabel("Scene preview")
             } else {
-                SceneDiagram(configuration: model.configuration, layout: model.configuration.layout)
+                SceneDiagram(model: model, layout: model.configuration.layout)
                     .aspectRatio(16 / 9, contentMode: .fit).accessibilityLabel("Scene layout preview")
             }
             HStack {
-                Toggle("Render chat", isOn: $model.configuration.chatEnabled)
+                Toggle("Show chat", isOn: $model.configuration.chatEnabled)
                 if step == .prepare {
                     Spacer()
                     DockFitControl(model: model, fit: model.dockFit, compact: true)
                 }
             }.toggleStyle(.switch)
             SourceLevelMeters(meters: engine.meters)
-            Text(model.rehearsalActive ? "LOCAL REC · Preview is live. Nothing is sent to Twitch." : "Preview records a local rehearsal using your selected sources. Nothing is sent to Twitch.")
-                .font(.caption).foregroundStyle(.secondary)
+            if model.rehearsalActive {
+                Text("REC · Recording locally. Nothing is sent online.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             if let message = model.message ?? engine.errorMessage {
                 Label(message, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange)
             }

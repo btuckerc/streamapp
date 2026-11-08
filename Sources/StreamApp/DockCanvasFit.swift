@@ -38,6 +38,8 @@ final class DockCanvasFit: ObservableObject {
     private let domain = "com.apple.dock" as CFString
     private let backupURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/StreamApp/dock-size.json")
     private var saved: Saved?
+    /// An interrupted restore left the Dock resized; turning Fit off finishes it.
+    var needsRestore: Bool { saved?.recovering == true }
     private var monitor: Task<Void, Never>?
     private var desktopAspect = 16.0 / 9
     private var lastMeasurement: Measurement?
@@ -160,7 +162,7 @@ final class DockCanvasFit: ObservableObject {
     private func refresh() async {
         guard !busy, let value = saved else { return }
         guard value.recovering != true else {
-            message = "Dock restoration is pending. Turn off Fit 16:9 to finish."
+            message = "Your Dock is still resized."
             return
         }
         guard let measured = measurement(value.displayID) else {
@@ -320,7 +322,7 @@ struct DockFitControl: View {
     @State private var error: String?
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Toggle("Fit 16:9", isOn: Binding(get: { fit.displayID != nil }, set: { enabled in
+            Toggle("Fit Dock to 16:9", isOn: Binding(get: { fit.displayID != nil }, set: { enabled in
                 if enabled { confirm = true } else { Task { await change(false) } }
             }))
             .disabled(model.busy || model.engine.isRunning || fit.busy || (fit.displayID == nil && model.configuration.windowID != nil))
@@ -328,6 +330,10 @@ struct DockFitControl: View {
             if fit.busy { ProgressView("Adjusting Dock…").controlSize(.small) }
             if let text = error ?? (compact ? nil : fit.message) {
                 Text(text).font(.caption).foregroundStyle(error == nil ? Color.secondary : Color.orange)
+            }
+            if fit.needsRestore && !fit.busy {
+                Button("Restore Dock") { Task { await change(false) } }
+                    .controlSize(.small).disabled(model.busy || model.engine.isRunning)
             }
         }
         .alert("Fit the Dock to your scene?", isPresented: $confirm) {

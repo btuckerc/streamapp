@@ -40,8 +40,11 @@ final class VideoEncoder: @unchecked Sendable {
 
     init(outputFD: Int32 = STDOUT_FILENO) throws {
         self.outputFD = outputFD
+        // Native 4:2:0 input: the compositor's final Core Image pass writes BT.709 video-range
+        // YCbCr directly, so VideoToolbox does no BGRA→YUV conversion pass and each pooled frame
+        // is 3.1 MB instead of 8.3 MB.
         let attrs: CFDictionary = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
             kCVPixelBufferWidthKey as String: 1920,
             kCVPixelBufferHeightKey as String: 1080,
             kCVPixelBufferIOSurfacePropertiesKey as String: [:],
@@ -88,6 +91,12 @@ final class VideoEncoder: @unchecked Sendable {
         guard status == noErr else { throw EncoderError.status("VTSessionSetProperty \(key)", status) }
     }
 
+    /// Only the YCbCr matrix is attached: Core Image then writes BT.709 video-range values of the
+    /// sRGB-encoded composite (the same values VideoToolbox derived from BGRA), and reading the
+    /// buffer back for preview round-trips exactly. A transfer-function tag would make Core Image
+    /// re-interpret the gamma when the preview reads it.
+    static let colorAttachments = [kCVImageBufferYCbCrMatrixKey as String: kCVImageBufferYCbCrMatrix_ITU_R_709_2] as CFDictionary
+
     func makePixelBuffer() throws -> CVPixelBuffer {
         stateLock.lock(); let pool = self.pool; let failed = _error; let done = closed; stateLock.unlock()
         if let failed { throw failed }
@@ -95,13 +104,14 @@ final class VideoEncoder: @unchecked Sendable {
         var pixel: CVPixelBuffer?
         let status = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(nil, pool, allocationHints, &pixel)
         guard status == kCVReturnSuccess, let pixel else { throw EncoderError.status("CVPixelBufferPoolCreatePixelBuffer", status) }
+        CVBufferSetAttachments(pixel, Self.colorAttachments, .shouldPropagate)
         return pixel
     }
 
     func encode(_ pixel: CVPixelBuffer, pts: CMTime) throws {
         guard CVPixelBufferGetWidth(pixel) == 1920, CVPixelBufferGetHeight(pixel) == 1080,
-              CVPixelBufferGetPixelFormatType(pixel) == kCVPixelFormatType_32BGRA else {
-            throw EncoderError.message("pixel buffer is not 1920x1080 BGRA")
+              CVPixelBufferGetPixelFormatType(pixel) == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange else {
+            throw EncoderError.message("pixel buffer is not 1920x1080 4:2:0 video range")
         }
         guard slots.wait(timeout: .now() + 1.0) == .success else { throw EncoderError.message("encoder buffer timeout") }
         stateLock.lock()
@@ -149,8 +159,13 @@ final class VideoEncoder: @unchecked Sendable {
         guard status == noErr, let sample, CMSampleBufferDataIsReady(sample) else {
             fail(EncoderError.status("compression callback", status == noErr ? -1 : status)); return
         }
-        guard let format = CMSampleBufferGetFormatDescription(sample) else { fail(EncoderError.message("missing H.264 format description")); return }
         muxLock.lock(); defer { muxLock.unlock() }
+        writeSample(sample)
+    }
+
+    /// Caller owns muxLock; compressed samples are muxed immediately.
+    private func writeSample(_ sample: CMSampleBuffer) {
+        guard let format = CMSampleBufferGetFormatDescription(sample) else { fail(EncoderError.message("missing H.264 format description")); return }
         if muxer == nil {
             var spsPtr: UnsafePointer<UInt8>?; var spsSize = 0; var ppsPtr: UnsafePointer<UInt8>?; var ppsSize = 0
             var spsCount = 0; var ppsCount = 0

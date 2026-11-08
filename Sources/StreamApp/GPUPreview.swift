@@ -10,6 +10,7 @@ final class PreviewFrames: @unchecked Sendable {
     private var serial: UInt64 = 0
     private var requested: Mode?
     private var mirrored = false
+    private var program = false
     private var surfaces: [ObjectIdentifier: Mode] = [:]
     func requestSurface(_ owner: ObjectIdentifier, mode: Mode?) {
         lock.lock(); defer { lock.unlock() }
@@ -23,19 +24,27 @@ final class PreviewFrames: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         requested = mode; buffer = nil; serial &+= 1
     }
-    func publish(_ value: CVPixelBuffer?, mirrored: Bool = false) {
+    func publish(_ value: CVPixelBuffer?, mirrored: Bool = false, program: Bool = false) {
         lock.lock(); defer { lock.unlock() }
         guard requested != nil else { return }
-        if buffer === value, self.mirrored == mirrored { return }
-        buffer = value; self.mirrored = mirrored; serial &+= 1
+        if buffer === value, self.mirrored == mirrored, self.program == program { return }
+        buffer = value; self.mirrored = mirrored; self.program = program; serial &+= 1
     }
-    func latest() -> (CVPixelBuffer?, UInt64, Bool) {
-        lock.lock(); defer { lock.unlock() }; return (buffer, serial, mirrored)
+    func latest() -> (buffer: CVPixelBuffer?, serial: UInt64, mirrored: Bool, program: Bool) {
+        lock.lock(); defer { lock.unlock() }; return (buffer, serial, mirrored, program)
+    }
+    private static let srgb = CGColorSpace(name: CGColorSpace.sRGB)!
+    /// Program frames are sRGB-encoded composites (BGRA, or encoder 4:2:0 tagged only with the BT.709 matrix).
+    /// VideoToolbox adds the session's BT.709 transfer tag to buffers it encodes, which would brighten the preview,
+    /// so program frames are always read as sRGB. Camera frames keep their device tags.
+    static func image(_ buffer: CVPixelBuffer, program: Bool) -> CIImage {
+        program ? CIImage(cvPixelBuffer: buffer, options: [.colorSpace: srgb]) : CIImage(cvPixelBuffer: buffer)
     }
     // Explicit diagnostic export only; never called by the presentation loop.
     func snapshot() -> CGImage? {
-        guard let buffer = latest().0 else { return nil }
-        let image = CIImage(cvPixelBuffer: buffer)
+        let latest = latest()
+        guard let buffer = latest.buffer else { return nil }
+        let image = Self.image(buffer, program: latest.program)
         return CIContext().createCGImage(image, from: image.extent)
     }
 }
@@ -66,6 +75,8 @@ final class PreviewSurface: MTKView, MTKViewDelegate {
         imageContext = CIContext(mtlDevice: device, options: [.cacheIntermediates: false])
         super.init(frame: .zero, device: device)
         framebufferOnly = false; colorPixelFormat = .bgra8Unorm
+        // Clear until a frame arrives, so the view behind can say what the preview is waiting for.
+        layer?.isOpaque = false
         presentsWithTransaction = true
         preferredFramesPerSecond = 30; isPaused = true
         enableSetNeedsDisplay = false; delegate = self
@@ -103,12 +114,12 @@ final class PreviewSurface: MTKView, MTKViewDelegate {
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) { lastSerial = nil }
     func draw(in view: MTKView) {
         guard active, slots.wait(timeout: .now()) == .success else { return }
-        let (buffer, serial, mirror) = frames.latest()
+        let (buffer, serial, mirror, program) = frames.latest()
         guard serial != lastSerial, let drawable = currentDrawable, let command = commands.makeCommandBuffer() else { slots.signal(); return }
         let bounds = CGRect(origin: .zero, size: drawableSize)
-        var image = CIImage(color: .black).cropped(to: bounds)
+        var image = CIImage(color: .clear).cropped(to: bounds)
         if let buffer {
-            var source = CIImage(cvPixelBuffer: buffer)
+            var source = PreviewFrames.image(buffer, program: program)
             if mirror { source = source.transformed(by: CGAffineTransform(translationX: source.extent.width, y: 0).scaledBy(x: -1, y: 1)) }
             let scale = min(bounds.width / source.extent.width, bounds.height / source.extent.height)
             source = source.transformed(by: CGAffineTransform(scaleX: scale, y: scale))

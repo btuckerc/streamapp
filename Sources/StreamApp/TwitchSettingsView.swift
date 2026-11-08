@@ -7,21 +7,17 @@ struct TwitchConnectionView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            if let account = session.account {
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Image(systemName: "checkmark.circle").foregroundStyle(.secondary)
-                    Text("Connected as @\(account.login)")
-                    connectionInfo
-                    Spacer()
-                    Button("Disconnect") { Task { await session.disconnect() } }.disabled(locked)
-                }
-            } else {
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Button(session.connecting ? "Connecting to Twitch…" : "Connect with Twitch") { session.connect() }
+            LabeledContent("Twitch account") {
+                if let account = session.account {
+                    HStack {
+                        Text("@\(account.login)").foregroundStyle(.secondary)
+                        Button("Disconnect") { Task { await session.disconnect() } }.disabled(locked)
+                    }
+                } else {
+                    Button(session.connecting ? "Connecting…" : "Connect…") { session.connect() }
                         .disabled(locked || session.connecting)
-                    connectionInfo
                 }
-            }
+            }.help("Reads chat and your stream key. Can't post messages or start a stream.")
             if let authorization = session.deviceAuthorization {
                 Text("Enter code \(authorization.userCode) on Twitch").font(.headline).textSelection(.enabled)
                 HStack {
@@ -33,13 +29,6 @@ struct TwitchConnectionView: View {
                 Text(session.status).font(.caption).foregroundStyle(.secondary)
             }
         }
-    }
-
-    private var connectionInfo: some View {
-        Image(systemName: "info.circle")
-            .foregroundStyle(.secondary)
-            .help("Reads chat and your stream key. Can't post messages or start a stream.")
-            .accessibilityLabel("About Twitch connection")
     }
 }
 
@@ -62,18 +51,20 @@ struct TwitchChatSettings: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            if session.account == nil { TwitchConnectionView(session: session, locked: locked) }
-            HStack {
-                TextField("Channel", text: $channel, prompt: Text(session.account.map { $0.login } ?? "Twitch username or link"))
-                    .onSubmit { applyChannel() }.disabled(locked || checking)
-                    .onChange(of: channel) { _, _ in channelError = nil }
-                if channel != model.configuration.twitchChatChannel {
-                    Button(checking ? "Checking…" : "Apply") { applyChannel() }
-                        .disabled(locked || checking)
+            LabeledContent("Channel") {
+                HStack {
+                    TextField("Channel", text: $channel, prompt: Text(session.account.map { $0.login } ?? "Username or link"))
+                        .labelsHidden()
+                        .onSubmit { applyChannel() }.disabled(locked || checking)
+                        .onChange(of: channel) { _, _ in channelError = nil }
+                    if channel != model.configuration.twitchChatChannel {
+                        Button(checking ? "Checking…" : "Apply") { applyChannel() }
+                            .disabled(locked || checking)
+                    }
+                    Button("Test…") { applyChannel(test: true) }
+                        .disabled(locked || checking || session.account == nil)
+                        .help(session.account == nil ? "Connect your Twitch account to test chat." : "Preview chat without recording or streaming")
                 }
-                Button("Test") { applyChannel(test: true) }
-                    .disabled(locked || checking || session.account == nil)
-                    .help("Preview chat without recording or streaming")
             }
             if let channelError { Text(channelError).font(.caption).foregroundStyle(.orange) }
         }
@@ -116,6 +107,8 @@ struct TwitchChatSettings: View {
 
 struct ChatAppearanceControls: View {
     @Binding var appearance: ChatAppearance
+    /// Settings tucks the individual toggles under "Details"; the chat check shows them flat.
+    var collapsesDetails = false
 
     var body: some View {
         Group {
@@ -127,23 +120,28 @@ struct ChatAppearanceControls: View {
                 ForEach(ChatAppearance.Preset.allCases) { preset in Text(preset.title).tag(Optional(preset)) }
             }
             .help("Presets replace the options below; individual changes show as Custom.")
-            HStack {
-                Text("Text size")
-                Slider(value: $appearance.fontSize, in: 20...48, step: 2)
-                    .accessibilityLabel("Chat text size at 1080p")
-                Text("\(Int(appearance.fontSize)) px").monospacedDigit().frame(width: 48, alignment: .trailing)
+            LabeledContent("Text size") {
+                SliderValue(title: "Chat text size at 1080p", value: $appearance.fontSize, range: 20...48, step: 2,
+                            readout: "\(Int(appearance.fontSize)) px")
             }.help("Pixels at 1080p output. Default 24 px.")
-            Toggle("Twitch name colors", isOn: $appearance.userColors)
-                .help("Dark colors are brightened for contrast.")
-            Toggle("Emotes", isOn: $appearance.emotes)
-                .help("Twitch, 7TV, BetterTTV, and FrankerFaceZ. Static images; codes are case-sensitive.")
-            Toggle("Highlight commands & mentions", isOn: $appearance.highlights)
-            Toggle("Timestamps", isOn: $appearance.timestamps)
-            Toggle("Channel heading", isOn: $appearance.showHeader)
-            Toggle("Connection status", isOn: $appearance.showStatus)
-            Toggle("Solid background", isOn: $appearance.solidBackground)
-                .help("Off uses a 90% dark background.")
+            if collapsesDetails {
+                ClickableDisclosure("Details") { details }
+            } else {
+                details
+            }
         }
+    }
+    @ViewBuilder private var details: some View {
+        Toggle("Twitch name colors", isOn: $appearance.userColors)
+            .help("Dark colors are brightened for contrast.")
+        Toggle("Emotes", isOn: $appearance.emotes)
+            .help("Twitch, 7TV, BetterTTV, and FrankerFaceZ. Static images; codes are case-sensitive.")
+        Toggle("Highlight commands & mentions", isOn: $appearance.highlights)
+        Toggle("Timestamps", isOn: $appearance.timestamps)
+        Toggle("Channel heading", isOn: $appearance.showHeader)
+        Toggle("Connection status", isOn: $appearance.showStatus)
+        Toggle("Solid background", isOn: $appearance.solidBackground)
+            .help("Off uses a 90% dark background.")
     }
 }
 
@@ -157,7 +155,7 @@ private final class TwitchChatCheckModel: ObservableObject {
 
     func start(channel: String, width: Int, appearance: ChatAppearance) {
         guard chat == nil else { return }
-        chat = Chat(onImage: { [weak self] image in self?.image = image }, channel: channel, width: width, appearance: appearance,
+        chat = Chat(onImage: { [weak self] image in self?.image = image }, channel: channel, size: CGSize(width: width, height: 1080), appearance: appearance,
                     onStatus: { [weak self] status in self?.status = status },
                     onTranscript: { [weak self] text in self?.transcript = text },
                     onEmoteStatus: { [weak self] text in self?.emoteStatus = text })

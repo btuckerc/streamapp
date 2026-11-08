@@ -51,6 +51,55 @@ struct AudioMixerTests {
         #expect(output.allSatisfy { $0 == 0 })
     }
 
+    @Test func awaySceneSilencesTheMicrophoneUnlessTurnedOff() throws {
+        var settings = StudioConfiguration(); settings.microphoneEnabled = true; settings.microphoneCompressionEnabled = false
+        settings.layout = .away
+        let input = try sample(interleaved: true, left: 0.5, right: 0.5)
+        for mutes in [true, false] {
+            settings.awayMutesMicrophone = mutes
+            let mixer = AudioMixer()
+            mixer.reset(configuration: settings, synthetic: false, epoch: CMSampleBufferGetPresentationTimeStamp(input).seconds)
+            try mixer.append(input, microphone: true)
+            var block = [Float](repeating: 0, count: 1920)
+            for _ in 0..<12 { block.withUnsafeMutableBufferPointer { mixer.pull(into: $0) } }
+            #expect(abs(mixer.levels.output.peak - (mutes ? 0 : 0.5)) < 0.001)
+        }
+    }
+
+    /// Away chosen while a slower switch (say, to Desktop) still waits for its source: the room is
+    /// silent from the next block, stays silent while that older switch commits, and is heard again
+    /// only once the change back to Desktop commits. Away that only covers a lost webcam stays live.
+    @Test(arguments: [false, true])
+    func awayRequestedBehindASlowerSwitchSilencesAtOnce(coversWebcam: Bool) throws {
+        var fullCamera = StudioConfiguration(); fullCamera.microphoneEnabled = true; fullCamera.microphoneCompressionEnabled = false
+        fullCamera.layout = .justChatting
+        var desktop = fullCamera; desktop.layout = .desktopChat
+        var away = fullCamera; away.layout = .away; away.awayCoversWebcam = coversWebcam
+        let input = try sample(interleaved: true, left: 0.5, right: 0.5, frames: 48_000)
+        let mixer = AudioMixer()
+        mixer.reset(configuration: fullCamera, synthetic: false, epoch: CMSampleBufferGetPresentationTimeStamp(input).seconds)
+        try mixer.append(input, microphone: true)
+        var block = [Float](repeating: 0, count: 1920)
+        func peak() -> Float {
+            block.withUnsafeMutableBufferPointer { mixer.pull(into: $0) }
+            return block.map(abs).max() ?? 0
+        }
+        #expect(abs(peak() - 0.5) < 0.001)
+        mixer.hide(as: desktop) // Full Camera → Desktop requested; nothing to hide.
+        #expect(abs(peak() - 0.5) < 0.001)
+        mixer.hide(as: away) // Away requested before Desktop's source is ready.
+        let live: Float = coversWebcam ? 0.5 : 0
+        #expect(abs(peak() - live) < 0.001)
+        mixer.configure(desktop) // The older Desktop update commits.
+        #expect(abs(peak() - live) < 0.001)
+        mixer.configure(away)
+        #expect(abs(peak() - live) < 0.001)
+        mixer.hide(as: desktop) // Back to Desktop: heard again only when it commits.
+        #expect(abs(peak() - live) < 0.001)
+        mixer.configure(desktop)
+        #expect(abs(peak() - 0.5) < 0.001)
+    }
+
     @Test func mixedPeaksAreBounded() throws {
         let mixer = AudioMixer()
         var settings = StudioConfiguration(); settings.microphoneEnabled = true; settings.systemAudioEnabled = true
@@ -110,6 +159,31 @@ struct AudioMixerTests {
         #expect(all[90000] < 0.4 && all[90000] > 0.1)
         #expect(abs(all[90001] / all[90000] + 0.5) < 0.001)
         #expect(whole.levels.gainReduction > 6)
+    }
+
+    @Test(arguments: AudioDucking.allCases)
+    func duckingLowersAppAudioOnlyWhileSpeakingThenRecovers(ducking: AudioDucking) throws {
+        var settings = StudioConfiguration(); settings.microphoneEnabled = true; settings.systemAudioEnabled = true
+        settings.microphoneCompressionEnabled = false; settings.systemAudioDucking = ducking
+        let music = try sample(interleaved: true, left: 0.5, right: 0.5, frames: 72_000)
+        let mixer = AudioMixer()
+        mixer.reset(configuration: settings, synthetic: false, epoch: CMSampleBufferGetPresentationTimeStamp(music).seconds)
+        try mixer.append(music, microphone: false)
+        // 200 ms of speech at −20 dBFS, then silence.
+        try mixer.append(try sample(interleaved: true, left: 0.1, right: 0.1, frames: 9_600), microphone: true)
+        var output = [Float](repeating: 0, count: 144_000)
+        output.withUnsafeMutableBufferPointer { mixer.pull(into: $0) }
+        // Buffers carry creation-time stamps, so locate speech onset (music alone never exceeds 0.5).
+        let onset = try #require(stride(from: 0, to: output.count, by: 2).first { output[$0] > 0.55 }) / 2
+        func appGain(after frames: Int, speaking: Bool) -> Float { (output[(onset + frames) * 2] - (speaking ? 0.1 : 0)) / 0.5 }
+        let ducked = Float(pow(10, -ducking.depth / 20))
+        // 180 ms into speech the 50 ms attack has covered all but e^−3.6 of the dip.
+        #expect(abs(appGain(after: 8_640, speaking: true) - ducked) < 0.03)
+        // The 200 ms hold bridges pauses: still ducked 190 ms after speech stops.
+        #expect(abs(appGain(after: 18_720, speaking: false) - ducked) < 0.03)
+        // One 600 ms release time constant after the hold, 1 − 1/e of the dip has recovered.
+        let recovered = 1 - (1 - ducked) * Float(exp(-1.0))
+        #expect(abs(appGain(after: 47_990, speaking: false) - recovered) < 0.02)
     }
 
     private func sample(interleaved: Bool, left: Float, right: Float, frames: Int = 960) throws -> CMSampleBuffer {

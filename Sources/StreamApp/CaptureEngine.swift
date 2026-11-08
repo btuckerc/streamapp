@@ -10,13 +10,15 @@ final class AudioMeters: ObservableObject {
     @Published private(set) var microphone = AudioLevel.silent
     @Published private(set) var system = AudioLevel.silent
     @Published private(set) var output = AudioLevel.silent
+    @Published private(set) var limiterReduction: Float = 0
 
     func update(_ levels: AudioMixer.Levels) {
         if microphone != levels.microphone { microphone = levels.microphone }
         if system != levels.system { system = levels.system }
         if output != levels.output { output = levels.output }
+        if limiterReduction != levels.limiterReduction { limiterReduction = levels.limiterReduction }
     }
-    func clear() { update((.silent, .silent, .silent, 0)) }
+    func clear() { update((.silent, .silent, .silent, 0, 0)) }
 }
 
 @MainActor
@@ -32,18 +34,120 @@ final class StudioEngine: ObservableObject {
     @Published private(set) var videoPreviewError: String?
     @Published private(set) var status = "Idle"
     @Published private(set) var outputHealth = "Idle"
+    @Published private(set) var privacyStatus: String?
     @Published private(set) var captureApplications: [DeviceOption] = []
     /// Non-fatal camera warning; the session keeps running without the frame.
     @Published private(set) var cameraStatus: String?
-    /// Most recent recording file that exists on disk; cleared when the next session starts.
-    @Published private(set) var lastRecordingURL: URL?
+    /// A session or preview holds the camera open; macOS offers Video Effects only then.
+    @Published private(set) var cameraOpen = false
+    @Published private(set) var microphoneStatus: String?
+    @Published private(set) var resolvedMicrophoneID: String?
+    struct RecordingResult: Equatable {
+        let url: URL
+        let bytes: Int64
+        let seconds: Double
+        /// False when the session ended with an error, so the file may be cut short.
+        let complete: Bool
+    }
+    /// The latest recording on disk. Kept through a failed start; cleared once a new session runs.
+    @Published private(set) var lastRecording: RecordingResult?
     /// Encoder progress of the running session (frames/seconds from FFmpeg `-progress`); nil when idle.
     var outputHealthSnapshot: MediaOutput.Health? { output?.health }
     var annotationWindowID: CGWindowID?
     var teleprompterWindowIDs: Set<CGWindowID> = []
+    var cameraArrangeWindowID: CGWindowID?
+    @Published private(set) var cameraDragAnchor: CameraAnchor?
+    @Published private(set) var cameraDodgeAnchor: CameraAnchor?
+    private var cursorGlobalMonitor: Any?
+    private var cursorLocalMonitor: Any?
+    private var cursorDodging = false
+    private var cameraArrangementActive = false
+    func setCameraArrangementActive(_ active: Bool) {
+        cameraArrangementActive = active
+        reconcileCursorAvoidance()
+    }
+
+    func setCameraDrag(_ anchor: CameraAnchor?) {
+        guard cameraDragAnchor != anchor else { return }
+        cameraDragAnchor = anchor
+        inputs?.setCameraDrag(anchor); previewInputs?.setCameraDrag(anchor)
+        if anchor != nil { cursorDodging = false; cameraDodgeAnchor = nil }
+    }
+    func finishCameraDrag(committing anchor: CameraAnchor) {
+        inputs?.finishCameraDrag(committing: anchor); previewInputs?.finishCameraDrag(committing: anchor)
+        cameraDragAnchor = nil
+    }
+    /// AppKit supplies display metrics once per event; crop math itself is pure and shared.
+    private func captureRegion(_ full: CGRect, configuration c: StudioConfiguration) -> CGRect {
+        guard c.windowID == nil, let screen = captureScreen(c) else {
+            return c.dockFitRegion?.crop(full, selectedDisplayID: c.displayID, windowID: c.windowID) ?? full
+        }
+        let topInset = max(screen.safeAreaInsets.top, screen.frame.maxY - screen.visibleFrame.maxY)
+        return DisplayCaptureGeometry.crop(full, displayBounds: CGRect(origin: .zero, size: screen.frame.size),
+            topInset: topInset, includeMenuBar: c.includeMenuBar,
+            dockHeightFraction: c.dockFitRegion.flatMap { $0.displayID == c.displayID ? $0.heightFraction : nil })
+    }
+    private func captureScreen(_ c: StudioConfiguration) -> NSScreen? {
+        NSScreen.screens.first {
+            ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == c.displayID
+        }
+    }
+    func cameraDisplayMapping(configuration c: StudioConfiguration) -> CameraDisplayMapping? {
+        guard c.layout == .desktopChat, c.cameraEnabled, c.windowID == nil, let screen = captureScreen(c) else { return nil }
+        let sessionSource = isRunning && configuration.displayID == c.displayID && configuration.windowID == nil
+        let previewSource = previewStream != nil && previewConfiguration.displayID == c.displayID && previewConfiguration.windowID == nil
+        let full = sessionSource && !screenRect.isEmpty ? screenRect :
+            (previewSource && !previewScreenRect.isEmpty ? previewScreenRect : CGRect(origin: .zero, size: screen.frame.size))
+        let region = captureRegion(full, configuration: c)
+        let pixelScale = sessionSource ? screenScale : previewSource ? previewScreenScale : screen.backingScaleFactor
+        return CameraDisplayMapping(region: region, displayFrame: screen.frame,
+            desktop: SceneGeometry(configuration: c).desktop,
+            sourceSize: DisplayCaptureGeometry.outputSize(region: region, pixelScale: pixelScale))
+    }
+    private func reconcileCursorAvoidance() {
+        let c = isRunning ? configuration : previewConfiguration
+        let enabled = (isRunning || (previewRenderer != nil && videoPreviewMode == .program)) &&
+            c.cameraAvoidCursor && c.cameraEnabled && c.layout == .desktopChat && c.windowID == nil
+        if enabled {
+            if cursorLocalMonitor == nil {
+                let mask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
+                cursorGlobalMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask) { [weak self] _ in
+                    MainActor.assumeIsolated { self?.cursorMoved() }
+                }
+                cursorLocalMonitor = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] event in
+                    self?.cursorMoved(); return event
+                }
+            }
+            cursorMoved()
+        } else {
+            if let cursorGlobalMonitor { NSEvent.removeMonitor(cursorGlobalMonitor) }
+            if let cursorLocalMonitor { NSEvent.removeMonitor(cursorLocalMonitor) }
+            cursorGlobalMonitor = nil; cursorLocalMonitor = nil; cursorDodging = false
+            inputs?.setCameraDodge(nil); previewInputs?.setCameraDodge(nil)
+            if cameraDodgeAnchor != nil { cameraDodgeAnchor = nil }
+        }
+    }
+    private func cursorMoved() {
+        let c = isRunning ? configuration : previewConfiguration
+        guard let mapping = cameraDisplayMapping(configuration: c) else { return }
+        let g = SceneGeometry(configuration: c)
+        let anchor = CameraPlacement.dodgeAnchor(home: c.cameraAnchor)
+        let dodge = CameraPlacement.rect(anchor: anchor, size: g.camera.size, desktop: g.desktop)
+        cursorDodging = CameraPlacement.shouldDodge(cursor: mapping.toCanvas(NSEvent.mouseLocation),
+            home: g.camera, dodge: dodge, dodging: cursorDodging,
+            enabled: !c.cameraPunchIn && cameraDragAnchor == nil && !cameraArrangementActive)
+        let next = cursorDodging ? anchor : nil
+        if cameraDodgeAnchor != next { cameraDodgeAnchor = next }
+        inputs?.setCameraDodge(cursorDodging ? anchor : nil)
+        previewInputs?.setCameraDodge(cursorDodging ? anchor : nil)
+    }
     private var captureFilterRevision: UInt64 = 0
     private var captureFilterUpdate: Task<Void, Error>?
     private var desiredConfiguration = StudioConfiguration()
+    /// The newest configuration handed to `update`, which may still be queued behind an earlier one.
+    private var requestedConfiguration: StudioConfiguration?
+    /// What `request` last put on air ahead of a commit, so repeated requests skip reconfiguring.
+    private var requestedMask: StudioConfiguration?
     private var inputs: RenderInputs?
     private var bridge: CaptureBridge?
     private var audioBridge: CaptureBridge?
@@ -56,9 +160,12 @@ final class StudioEngine: ObservableObject {
     private var audioRevision: UInt64 = 0
     private var audioUpdate: Task<Void, Error>?
     private var audioApplications: [NSRunningApplication] = []
-    private var camera: CameraCapture?
+    private var camera: CameraCapture? { didSet { cameraOpen = camera != nil || previewCamera != nil } }
     private var chat: Chat?
     private var monitor: Task<Void, Never>?
+    /// Held only while a session runs: keeps App Nap from throttling capture/encode in a windowless menu-bar app,
+    /// and keeps the system and display awake (a sleeping display stops ScreenCaptureKit frames mid-stream).
+    private var sessionActivity: NSObjectProtocol?
     private var previewMonitor: Task<Void, Never>?
     private var configuration = StudioConfiguration()
     private var synthetic = false
@@ -79,7 +186,7 @@ final class StudioEngine: ObservableObject {
     private var previewConfiguration = StudioConfiguration()
     private var previewSynthetic = false
     private var previewInputs: RenderInputs?
-    private var previewCamera: CameraCapture?
+    private var previewCamera: CameraCapture? { didSet { cameraOpen = camera != nil || previewCamera != nil } }
     private var previewBridge: CaptureBridge?
     private var previewAudioBridge: CaptureBridge?
     private var previewReferenceStream: SCStream?
@@ -122,13 +229,16 @@ final class StudioEngine: ObservableObject {
         let task = Task { [self] in
             await previous?.value
             guard token == previewGeneration else { return }
-            await stopMenuPreview()
+            // A rebuild keeps the last preview frame up until the new renderer replaces it.
+            let keepFrame = previewDesired && videoPreviewMode != nil
+            await stopMenuPreview(clearFrame: !keepFrame)
+            defer { if keepFrame, token == previewGeneration, previewRenderer == nil, !isRunning { previewFrames.publish(nil) } }
             guard token == previewGeneration, previewDesired, !isRunning, !starting, !stopping else { return }
             meterPreviewError = nil
             videoPreviewError = nil
             let c = previewConfiguration
             let mode = videoPreviewMode
-            let needsScreen = mode == .program && c.layout == .desktopChat
+            let needsScreen = mode == .program && c.layout.showsDesktop
             // Missing permission is an onboarding state, not a preview failure.
             // Do not open any devices until the configured preview can run.
             if !previewSynthetic {
@@ -142,7 +252,6 @@ final class StudioEngine: ObservableObject {
             }
             let inputs = RenderInputs()
             inputs.configure(c)
-            inputs.setReduceMotion(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
             previewInputs = inputs
             let meter = MediaOutput()
             previewOutput = meter
@@ -183,11 +292,12 @@ final class StudioEngine: ObservableObject {
                     }
                     guard token == previewGeneration else { await stopMenuPreview(); return }
                     if mode == .program && c.chatEnabled && !previewSynthetic {
-                        previewChat = Chat(onImage: { image in inputs.setChat(image) }, channel: c.twitchChatChannel, width: Int(c.chatWidth), appearance: c.chatAppearance)
+                        previewChat = Chat(onImage: { image in inputs.setChat(image) }, channel: c.twitchChatChannel, size: SceneGeometry.chatSize(c), appearance: c.chatAppearance)
                     }
                     let renderer = try FrameRenderer(inputs: inputs, preview: previewFrames, outputFD: nil, synthetic: previewSynthetic)
                     previewRenderer = renderer
                     renderer.start(epoch: CMClockGetTime(CMClockGetHostTimeClock()).seconds)
+                    reconcileCursorAvoidance()
                 }
                 meter.startPreviewClock(configuration: c)
                 meterPreviewActive = true
@@ -195,7 +305,6 @@ final class StudioEngine: ObservableObject {
                     while !Task.isCancelled {
                         do { try await Task.sleep(for: .milliseconds(200)) } catch { return }
                         guard let self, let meter = self.previewOutput else { return }
-                        inputs.setReduceMotion(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
                         if self.previewAudioApplications.contains(where: \.isTerminated) {
                             inputs.fail("Selected audio application quit. Reopen it and restart capture.")
                         }
@@ -210,6 +319,9 @@ final class StudioEngine: ObservableObject {
                         self.meters.update(meter.levels)
                         let echo = meter.echoCancellationStatus
                         if self.echoCancellationStatus != echo { self.echoCancellationStatus = echo }
+                        let microphoneStatus = meter.microphoneStatus
+                        if self.microphoneStatus != microphoneStatus { self.microphoneStatus = microphoneStatus }
+                        if self.resolvedMicrophoneID != meter.resolvedMicrophoneID { self.resolvedMicrophoneID = meter.resolvedMicrophoneID }
                     }
                 }
             } catch {
@@ -227,13 +339,13 @@ final class StudioEngine: ObservableObject {
 
     /// Starts the program preview's screen stream into the current preview inputs.
     private func startPreviewScreen(_ c: StudioConfiguration, bridge: CaptureBridge, token: UInt64) async throws {
-        let filter = try await captureFilter(c)
+        let filter = try await captureFilter(c, inputs: previewInputs)
         guard token == previewGeneration else { throw CancellationError() }
         let options = SCStreamConfiguration()
-        setCaptureGeometry(options, rect: filter.contentRect, scale: CGFloat(filter.pointPixelScale), configuration: c)
+        setCaptureGeometry(options, rect: filter.contentRect, scale: CGFloat(filter.pointPixelScale), configuration: c, inputs: previewInputs)
         options.minimumFrameInterval = CMTime(value: 1, timescale: 30)
-        options.pixelFormat = kCVPixelFormatType_32BGRA
-        options.queueDepth = 3
+        options.pixelFormat = c.privacyShieldEnabled ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange : kCVPixelFormatType_32BGRA
+        options.queueDepth = c.privacyShieldEnabled ? 4 : 3
         options.capturesAudio = false
         let stream = SCStream(filter: filter, configuration: options, delegate: bridge)
         previewScreenOptions = options
@@ -256,7 +368,7 @@ final class StudioEngine: ObservableObject {
         return false
     }
 
-    private func stopMenuPreview() async {
+    private func stopMenuPreview(clearFrame: Bool = true) async {
         previewMonitor?.cancel(); previewMonitor = nil
         previewAudioApplications = []
         let stream = previewStream; previewStream = nil
@@ -268,8 +380,10 @@ final class StudioEngine: ObservableObject {
         if camera != nil { cameraStatus = nil }
         let renderer = previewRenderer; previewRenderer = nil
         previewChat?.stop(); previewChat = nil
+        reconcileCursorAvoidance()
         meterPreviewActive = false
-        if let renderer { _ = try? await renderer.finish() }
+        previewInputs?.closeScreenWaits()
+        if let renderer { _ = try? await renderer.finish(clearingPreview: clearFrame) }
         if let camera { await camera.stop() }
         if let stream { try? await stream.stopCapture() }
         if let audioStream { try? await audioStream.stopCapture() }
@@ -279,9 +393,11 @@ final class StudioEngine: ObservableObject {
         previewAudioBridge = nil
         previewReferenceBridge = nil
         if !isRunning {
-            previewFrames.publish(nil)
+            if clearFrame { previewFrames.publish(nil) }
             meters.clear()
             echoCancellationStatus = nil
+            microphoneStatus = nil
+            resolvedMicrophoneID = nil
             Self.releaseFreedMemory()
         }
     }
@@ -308,17 +424,19 @@ final class StudioEngine: ObservableObject {
         guard !isRunning, !starting, !stopping else { throw EngineError.message("A session is already active or changing") }
         starting = true; generation &+= 1; let session = generation
         await reconcileMenuPreview()
-        errorMessage = nil; status = "Starting"; outputHealth = "Preparing output…"; lastRecordingURL = nil
+        errorMessage = nil; status = "Starting"; outputHealth = "Starting…"
+        sessionActivity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .idleDisplaySleepDisabled], reason: "Recording or streaming")
         self.configuration = configuration; self.synthetic = synthetic
         desiredConfiguration = configuration
         do {
-            let inputs = RenderInputs(); inputs.configure(configuration); self.inputs = inputs
-            inputs.setReduceMotion(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
+            let inputs = RenderInputs(historyEnabled: configuration.privacyShieldEnabled); inputs.configure(configuration); self.inputs = inputs
             let output = MediaOutput(); self.output = output
             let bridge = CaptureBridge(inputs: inputs, output: output); self.bridge = bridge
             if !synthetic {
-                try await configureScreen(configuration)
-                try await configureSystemAudio(configuration)
+                // One enumeration serves the screen and audio filters of this start.
+                let content = ShareableContentOnce()
+                try await configureScreen(configuration, content: content)
+                try await configureSystemAudio(configuration, content: content)
                 try ensureCurrent(session)
                 if configuration.cameraEnabled { try await startCamera(configuration) }
                 try ensureCurrent(session)
@@ -329,13 +447,14 @@ final class StudioEngine: ObservableObject {
             let renderer = try FrameRenderer(inputs: inputs, preview: previewFrames, outputFD: output.videoFD, synthetic: synthetic)
             self.renderer = renderer
             renderer.start(epoch: output.beginMediaClock(configuration: configuration))
-            starting = false; isRunning = true; status = output.status
+            starting = false; isRunning = true; status = output.status; lastRecording = nil
+            reconcileCursorAvoidance()
+            privacyStatus = renderer.privacyStatus
             monitor = Task { [weak self] in
                 var nextHealth = 0.0
                 while !Task.isCancelled {
                     do { try await Task.sleep(for: .milliseconds(200)) } catch { return }
                     guard let self else { return }
-                    self.inputs?.setReduceMotion(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
                     if self.audioApplications.contains(where: \.isTerminated) {
                         self.inputs?.fail("Selected audio application quit. Reopen it and restart capture.")
                     }
@@ -349,12 +468,23 @@ final class StudioEngine: ObservableObject {
                     if let levels = self.output?.levels { self.meters.update(levels) }
                     let echo = self.output?.echoCancellationStatus
                     if self.echoCancellationStatus != echo { self.echoCancellationStatus = echo }
-                    let status = self.output?.status ?? "Idle"
+                    let privacy = self.renderer?.privacyStatus
+                    if self.privacyStatus != privacy { self.privacyStatus = privacy }
+                    let microphoneStatus = self.output?.microphoneStatus
+                    if self.microphoneStatus != microphoneStatus { self.microphoneStatus = microphoneStatus }
+                    if self.resolvedMicrophoneID != self.output?.resolvedMicrophoneID { self.resolvedMicrophoneID = self.output?.resolvedMicrophoneID }
+                    let status = [self.output?.status, self.renderer?.privacyStatus].compactMap { $0 }.joined(separator: " · ")
                     if self.status != status { self.status = status }
                     let now = ProcessInfo.processInfo.systemUptime
                     if now >= nextHealth {
                         nextHealth = now + 1
-                        let health = self.output?.health.summary ?? "Idle"
+                        var health = self.output?.health.summary ?? "Idle"
+                        // Thermal pressure throttles encode/render before frames are dropped; say why early.
+                        switch ProcessInfo.processInfo.thermalState {
+                        case .serious: health += " · Mac is hot; performance may be throttled"
+                        case .critical: health += " · Mac is overheating; frames may drop"
+                        default: break
+                        }
                         if self.outputHealth != health { self.outputHealth = health }
                     }
                 }
@@ -366,7 +496,20 @@ final class StudioEngine: ObservableObject {
         }
     }
 
+    /// Records the newest configuration the user asked for, ahead of serialized updates still applying
+    /// an older one. Hiding the webcam or the desktop is on air by the next frame and silencing the
+    /// microphone by the next audio block; queued updates then commit under the same mask.
+    func request(_ next: StudioConfiguration) {
+        requestedConfiguration = next
+        guard isRunning, let inputs else { return }
+        output?.hide(as: next)
+        let masked = privacyMasked(configuration)
+        if masked != configuration && masked != requestedMask { inputs.configure(masked) }
+        requestedMask = masked
+    }
+
     func update(configuration next: StudioConfiguration) async throws {
+        request(next)
         let previous = audioUpdate
         let task = Task { [self] in
             _ = try? await previous?.value
@@ -378,35 +521,76 @@ final class StudioEngine: ObservableObject {
 
     private func applyUpdate(configuration next: StudioConfiguration) async throws {
         guard !stopping else { return }
+        defer { reconcileCursorAvoidance() }
         desiredConfiguration = next
         if !isRunning {
             if previewDesired {
                 let old = previewConfiguration
                 if meterPreviewActive, old.microphoneID == next.microphoneID,
+                   old.microphoneChannels == next.microphoneChannels,
+                   old.microphoneSyncOffsetMs == next.microphoneSyncOffsetMs,
+                   old.systemAudioSyncOffsetMs == next.systemAudioSyncOffsetMs,
                    old.microphoneEnabled == next.microphoneEnabled, old.systemAudioEnabled == next.systemAudioEnabled,
                    old.microphoneEchoCancellationEnabled == next.microphoneEchoCancellationEnabled,
                    old.systemAudioApplicationID == next.systemAudioApplicationID,
                    old.displayID == next.displayID, old.windowID == next.windowID,
-                   old.cameraEnabled == next.cameraEnabled, old.cameraID == next.cameraID,
-                   old.chatEnabled == next.chatEnabled, old.twitchChatChannel == next.twitchChatChannel, old.chatWidth == next.chatWidth,
                    old.showStreamAppWindows == next.showStreamAppWindows,
                    old.teleprompterInCapture == next.teleprompterInCapture,
                    old.includeMenuBar == next.includeMenuBar,
-                   old.excludedApplicationIDs == next.excludedApplicationIDs, old.excludedWindowIDs == next.excludedWindowIDs {
+                   old.privacyShieldEnabled == next.privacyShieldEnabled,
+                   old.excludedApplicationIDs == next.excludedApplicationIDs, old.excludedWindowIDs == next.excludedWindowIDs,
+                   let inputs = previewInputs {
                     previewConfiguration = next
-                    // A layout switch only adds or removes the screen stream; the camera,
-                    // microphone, and renderer stay open so the scene transition plays live.
-                    let wantsScreen = !previewSynthetic && videoPreviewMode == .program && next.layout == .desktopChat
-                    if wantsScreen, previewStream == nil { guard await addPreviewScreen(next) else { return } }
+                    // Scene, webcam, and chat changes add or remove only that source; the microphone,
+                    // renderer, and preview surface stay up, so the change plays live instead of blanking.
+                    let mode = videoPreviewMode, token = previewGeneration
+                    let cameraChanged = old.cameraEnabled != next.cameraEnabled || old.cameraID != next.cameraID
+                    if cameraChanged { videoPreviewError = nil }
+                    if cameraChanged, let camera = previewCamera {
+                        // Off is immediate: the renderer drops the webcam before the device closes.
+                        var hidden = old; hidden.cameraEnabled = false; inputs.configure(hidden)
+                        previewCamera = nil; cameraStatus = nil
+                        await camera.stop()
+                        inputs.setCamera(nil)
+                    }
+                    if cameraChanged, mode != nil, next.cameraEnabled, !previewSynthetic, previewCamera == nil {
+                        if AVCaptureDevice.authorizationStatus(for: .video) == .authorized {
+                            let camera = makeCamera(inputs: inputs)
+                            previewCamera = camera
+                            do { try await camera.start(id: next.cameraID); cameraStatus = nil }
+                            catch { if previewCamera === camera { previewCamera = nil }; videoPreviewError = error.localizedDescription }
+                        } else {
+                            videoPreviewError = "Camera access is off."
+                        }
+                    }
+                    // A rebuild or teardown during the awaits owns the preview now.
+                    guard token == previewGeneration, previewInputs === inputs else { return }
+                    if mode == .program, !previewSynthetic,
+                       old.chatEnabled != next.chatEnabled || old.twitchChatChannel != next.twitchChatChannel {
+                        previewChat?.stop(); previewChat = nil; inputs.setChat(nil)
+                        if next.chatEnabled {
+                            previewChat = Chat(onImage: { image in inputs.setChat(image) }, channel: next.twitchChatChannel, size: SceneGeometry.chatSize(next), appearance: next.chatAppearance)
+                        }
+                    }
+                    // Redraw the chat page for its next slot before the scene moves (see `Chat.resize`).
+                    previewChat?.resize(to: SceneGeometry.chatSize(next))
+                    let wantsScreen = !previewSynthetic && mode == .program && next.layout.showsDesktop
+                    if wantsScreen, previewStream == nil {
+                        // The current scene keeps playing until the desktop's first frame is ready.
+                        let mark = inputs.screenMark()
+                        guard await addPreviewScreen(next) else { return }
+                        await inputs.waitForScreen(after: mark)
+                        guard token == previewGeneration, previewInputs === inputs else { return }
+                    }
                     let leftScreen = wantsScreen ? nil : previewStream
                     if leftScreen != nil { previewStream = nil; previewScreenOptions = nil }
-                    if old.dockFitRegion != next.dockFitRegion, videoPreviewMode == .program,
-                       next.layout == .desktopChat, let stream = previewStream, let options = previewScreenOptions {
-                        setCaptureGeometry(options, rect: previewScreenRect, scale: previewScreenScale, configuration: next)
+                    if old.dockFitRegion != next.dockFitRegion, mode == .program,
+                       next.layout.showsDesktop, let stream = previewStream, let options = previewScreenOptions {
+                        setCaptureGeometry(options, rect: previewScreenRect, scale: previewScreenScale, configuration: next, inputs: inputs)
                         try await stream.updateConfiguration(options)
                     }
                     previewOutput?.configurePreview(next)
-                    previewInputs?.configure(next)
+                    inputs.configure(next)
                     previewChat?.updateAppearance(next.chatAppearance)
                     // Stop after the layout change so the last desktop frame carries the transition out.
                     if let leftScreen { try? await leftScreen.stopCapture() }
@@ -419,21 +603,32 @@ final class StudioEngine: ObservableObject {
         }
         previewConfiguration = next
         let old = configuration
+        guard old.privacyShieldEnabled == next.privacyShieldEnabled,
+              old.privacyHidesPersonalInfo == next.privacyHidesPersonalInfo else {
+            throw EngineError.message("Stop the session before changing Privacy shield settings")
+        }
         do {
             if !next.cameraEnabled {
-                var hidden = old; hidden.cameraEnabled = false; inputs?.configure(hidden)
+                var hidden = old; hidden.cameraEnabled = false; inputs?.configure(privacyMasked(hidden)); requestedMask = nil
             }
             if !synthetic {
-                if next.layout == .desktopChat && next.displayID == nil && next.windowID == nil { throw EngineError.message("Choose a display or window before switching to Desktop") }
+                if next.layout.showsDesktop && next.displayID == nil && next.windowID == nil { throw EngineError.message("Choose a display or window before switching to \(next.layout.title)") }
                 if old.cameraEnabled != next.cameraEnabled || old.cameraID != next.cameraID {
                     inputs?.setCamera(nil)
                     if let camera { await camera.stop(); self.camera = nil; cameraStatus = nil }
                     if next.cameraEnabled { try await startCamera(next) }
                 }
-                if old.layout != next.layout || old.displayID != next.displayID || old.windowID != next.windowID {
-                    try await configureScreen(next, preserveFrame: old.displayID == next.displayID && old.windowID == next.windowID)
-                } else if old.dockFitRegion != next.dockFitRegion, let stream, let options = screenOptions {
-                    setCaptureGeometry(options, rect: screenRect, scale: screenScale, configuration: next)
+                // Desktop ↔ Split keeps the running screen stream; only showing or hiding the desktop restarts it.
+                let sourceChanged = old.displayID != next.displayID || old.windowID != next.windowID
+                if next.layout.showsDesktop && (!old.layout.showsDesktop || sourceChanged) {
+                    // Make before break: the current scene stays on air until the incoming desktop's
+                    // first frame can be drawn, so the switch never shows a stale or missing desktop.
+                    let mark = inputs?.screenMark() ?? 0
+                    try await configureScreen(next)
+                    await inputs?.waitForScreen(after: mark)
+                    if stopping { return }
+                } else if next.layout.showsDesktop, old.dockFitRegion != next.dockFitRegion, let stream, let options = screenOptions {
+                    setCaptureGeometry(options, rect: screenRect, scale: screenScale, configuration: next, inputs: inputs)
                     try await stream.updateConfiguration(options)
                 }
                 if old.systemAudioEnabled != next.systemAudioEnabled || old.systemAudioApplicationID != next.systemAudioApplicationID {
@@ -441,19 +636,27 @@ final class StudioEngine: ObservableObject {
                 } else if old.microphoneEnabled != next.microphoneEnabled || old.microphoneEchoCancellationEnabled != next.microphoneEchoCancellationEnabled {
                     try await configureEchoReference(next)
                 }
-                if old.chatEnabled != next.chatEnabled || old.twitchChatChannel != next.twitchChatChannel || old.chatWidth != next.chatWidth { configureChat(next) }
+                if old.chatEnabled != next.chatEnabled || old.twitchChatChannel != next.twitchChatChannel { configureChat(next) }
+                chat?.resize(to: SceneGeometry.chatSize(next))
                 chat?.updateAppearance(next.chatAppearance)
                 if old.showStreamAppWindows != next.showStreamAppWindows || old.teleprompterInCapture != next.teleprompterInCapture || old.includeMenuBar != next.includeMenuBar || old.excludedApplicationIDs != next.excludedApplicationIDs || old.excludedWindowIDs != next.excludedWindowIDs {
                     try await updateCaptureFilter(next)
                 }
             }
+            // The mixer masks this with the newest request, so an older queued change cannot unmute Away.
             try await output?.updateAudio(configuration: next)
-            configuration = next; inputs?.configure(next)
+            configuration = next; inputs?.configure(privacyMasked(next)); requestedMask = nil
+            // Leaving the desktop: the scene changes first, so its last frame carries the change out,
+            // then screen capture stops.
+            if !synthetic, old.layout.showsDesktop, !next.layout.showsDesktop { try await configureScreen(next, preserveFrame: true) }
         } catch {
             errorMessage = error.localizedDescription
             await stop(); status = "Failed"
             throw error
         }
+    }
+    private func privacyMasked(_ c: StudioConfiguration) -> StudioConfiguration {
+        requestedConfiguration.map { c.hiding(as: $0) } ?? c
     }
     func stop() async {
         if stopping { return }
@@ -462,26 +665,41 @@ final class StudioEngine: ObservableObject {
         status = "Stopping"
         chat?.stop(); chat = nil
         audioApplications = []
-        if let camera { await camera.stop(); self.camera = nil; cameraStatus = nil }
-        if let stream { try? await stream.stopCapture(); self.stream = nil }
-        if let audioStream { try? await audioStream.stopCapture(); self.audioStream = nil }
-        if let referenceStream { try? await referenceStream.stopCapture(); self.referenceStream = nil }
+        // Render through the stop content time, then release video capture. Keep audio
+        // and the AEC reference alive for advanced sources and the PCM tail.
         var videoFrames: Int64?
         if let renderer {
-            do { videoFrames = try await renderer.finish() } catch { if errorMessage == nil { errorMessage = "Could not finalize video: \(error.localizedDescription)" } }
+            let output = self.output
+            do { videoFrames = try await renderer.finish { output?.prepareToStop(videoFrames: $0) } }
+            catch { if errorMessage == nil { errorMessage = "Could not finalize video: \(error.localizedDescription)" } }
             self.renderer = nil
         }
+        if let camera { await camera.stop(); self.camera = nil; cameraStatus = nil }
+        if let stream { try? await stream.stopCapture(); self.stream = nil }
         if let output {
             await output.stop(videoFrames: videoFrames)
-            if let url = output.recordingURL, FileManager.default.fileExists(atPath: url.path) { lastRecordingURL = url }
             if errorMessage == nil { errorMessage = output.errorMessage }
+            // Rendered ticks are exact at 30 fps; FFmpeg's last progress report can trail by a second or more.
+            let seconds = videoFrames.map { Double($0) / 30 } ?? output.mediaSeconds
+            // A start that failed before media flowed keeps the previous result.
+            if let url = output.recordingURL, seconds > 0,
+               let bytes = ((try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? NSNumber)?.int64Value, bytes > 0 {
+                lastRecording = RecordingResult(url: url, bytes: bytes, seconds: seconds, complete: errorMessage == nil)
+            }
             self.output = nil
         }
+        if let audioStream { try? await audioStream.stopCapture(); self.audioStream = nil }
+        if let referenceStream { try? await referenceStream.stopCapture(); self.referenceStream = nil }
         inputs = nil; bridge = nil; previewFrames.publish(nil)
         audioBridge = nil
         referenceBridge = nil; echoCancellationStatus = nil
+        privacyStatus = nil
+        microphoneStatus = nil
+        resolvedMicrophoneID = nil
         meters.clear()
         isRunning = false; starting = false; stopping = false
+        if let sessionActivity { ProcessInfo.processInfo.endActivity(sessionActivity); self.sessionActivity = nil }
+        reconcileCursorAvoidance()
         status = errorMessage == nil ? "Idle" : "Failed"
         await reconcileMenuPreview()
     }
@@ -497,20 +715,20 @@ final class StudioEngine: ObservableObject {
             chat?.stop(); chat = nil; inputs.setChat(nil)
             return
         }
-        if chat != nil, configuration.twitchChatChannel == c.twitchChatChannel, configuration.chatWidth == c.chatWidth { return }
+        if chat != nil, configuration.twitchChatChannel == c.twitchChatChannel { return }
         chat?.stop()
-        self.chat = Chat(onImage: { image in inputs.setChat(image) }, channel: c.twitchChatChannel, width: Int(c.chatWidth), appearance: c.chatAppearance)
+        self.chat = Chat(onImage: { image in inputs.setChat(image) }, channel: c.twitchChatChannel, size: SceneGeometry.chatSize(c), appearance: c.chatAppearance)
     }
     func refreshCaptureFilter() async throws {
         try await updateCaptureFilter(desiredConfiguration)
         if let previewStream, !previewSynthetic {
             let revision = previewGeneration
-            let filter = try await captureFilter(previewConfiguration)
+            let filter = try await captureFilter(previewConfiguration, inputs: previewInputs)
             guard revision == previewGeneration, previewStream === self.previewStream else { return }
             try await previewStream.updateContentFilter(filter)
             guard revision == previewGeneration, previewStream === self.previewStream,
                   let options = previewScreenOptions else { return }
-            setCaptureGeometry(options, rect: filter.contentRect, scale: CGFloat(filter.pointPixelScale), configuration: previewConfiguration)
+            setCaptureGeometry(options, rect: filter.contentRect, scale: CGFloat(filter.pointPixelScale), configuration: previewConfiguration, inputs: previewInputs)
             try await previewStream.updateConfiguration(options)
             guard revision == previewGeneration, previewStream === self.previewStream else { return }
             previewScreenRect = filter.contentRect
@@ -526,11 +744,11 @@ final class StudioEngine: ObservableObject {
         let update = Task { [weak self] in
             _ = try? await previous?.value
             guard let self, generation == session, !stopping, stream === self.stream else { return }
-            let filter = try await captureFilter(c)
+            let filter = try await captureFilter(c, inputs: inputs)
             guard generation == session, !stopping, stream === self.stream else { return }
             try await stream.updateContentFilter(filter)
             guard generation == session, !stopping, stream === self.stream, let options = screenOptions else { return }
-            setCaptureGeometry(options, rect: filter.contentRect, scale: CGFloat(filter.pointPixelScale), configuration: c)
+            setCaptureGeometry(options, rect: filter.contentRect, scale: CGFloat(filter.pointPixelScale), configuration: c, inputs: inputs)
             try await stream.updateConfiguration(options)
             guard generation == session, !stopping, stream === self.stream else { return }
             screenRect = filter.contentRect
@@ -540,9 +758,10 @@ final class StudioEngine: ObservableObject {
         defer { if revision == captureFilterRevision { captureFilterUpdate = nil } }
         try await update.value
     }
-    private func captureFilter(_ c: StudioConfiguration) async throws -> SCContentFilter {
-        let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false)
+    private func captureFilter(_ c: StudioConfiguration, inputs: RenderInputs?, content shared: ShareableContentOnce? = nil) async throws -> SCContentFilter {
+        let content = try await ShareableContentOnce.content(shared)
         if let id = c.windowID {
+            guard id != cameraArrangeWindowID else { throw EngineError.message("The webcam arrangement handle is private. Choose another source.") }
             guard !teleprompterWindowIDs.contains(id) || c.teleprompterInCapture else {
                 throw EngineError.message("The teleprompter is private. Choose another capture source.")
             }
@@ -561,21 +780,25 @@ final class StudioEngine: ObservableObject {
             $0.processID == ProcessInfo.processInfo.processIdentifier || excluded.contains($0.bundleIdentifier)
         }
         let excludedPIDs = Set(applications.map(\.processID))
+        var hiddenWindows: Set<CGWindowID> = []
         let exceptions = content.windows.filter { window in
             let owner = window.owningApplication?.processID ?? -1
             let visible = CaptureWindowPolicy.isVisible(
                 windowID: window.windowID, isOwnWindow: owner == ProcessInfo.processInfo.processIdentifier,
                 applicationExcluded: excluded.contains(window.owningApplication?.bundleIdentifier ?? ""), configuration: c,
-                annotationWindowID: annotationWindowID, teleprompterWindowIDs: teleprompterWindowIDs)
+                annotationWindowID: annotationWindowID, teleprompterWindowIDs: teleprompterWindowIDs,
+                cameraArrangeWindowID: cameraArrangeWindowID)
+            if !visible { hiddenWindows.insert(window.windowID) }
             return excludedPIDs.contains(owner) == visible
         }
+        inputs?.setCaptureExcludedWindows(hiddenWindows)
         let filter = SCContentFilter(display: display, excludingApplications: applications, exceptingWindows: exceptions)
         filter.includeMenuBar = c.includeMenuBar
         return filter
     }
 
-    private func audioCaptureFilter(_ c: StudioConfiguration) async throws -> (filter: SCContentFilter, applications: [NSRunningApplication]) {
-        let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false)
+    private func audioCaptureFilter(_ c: StudioConfiguration, content shared: ShareableContentOnce? = nil) async throws -> (filter: SCContentFilter, applications: [NSRunningApplication]) {
+        let content = try await ShareableContentOnce.content(shared)
         let displayID = c.displayID ?? CGMainDisplayID()
         guard let display = content.displays.first(where: { $0.displayID == displayID }) ?? content.displays.first else {
             throw EngineError.message("No display is available for system audio capture")
@@ -601,38 +824,32 @@ final class StudioEngine: ObservableObject {
         options.sampleRate = 48_000; options.channelCount = 2
         return options
     }
-    private func setCaptureGeometry(_ options: SCStreamConfiguration, rect full: CGRect, scale pixelScale: CGFloat, configuration c: StudioConfiguration) {
-        var rect = c.dockFitRegion?.crop(full, selectedDisplayID: c.displayID, windowID: c.windowID) ?? full
-        if c.windowID == nil, let screen = NSScreen.screens.first(where: {
-            ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == c.displayID
-        }) {
-            let topInset = max(screen.safeAreaInsets.top, screen.frame.maxY - screen.visibleFrame.maxY)
-            let dockFraction = c.dockFitRegion.flatMap { $0.displayID == c.displayID ? $0.heightFraction : nil }
-            rect = DisplayCaptureGeometry.crop(full, displayBounds: CGRect(origin: .zero, size: screen.frame.size),
-                                               topInset: topInset, includeMenuBar: c.includeMenuBar,
-                                               dockHeightFraction: dockFraction)
-        }
-        let width = max(1, rect.width * pixelScale)
-        let height = max(1, rect.height * pixelScale)
-        let scale = min(1, min(1920 / width, 1080 / height))
+    private func setCaptureGeometry(_ options: SCStreamConfiguration, rect full: CGRect, scale pixelScale: CGFloat, configuration c: StudioConfiguration, inputs: RenderInputs?) {
+        let rect = captureRegion(full, configuration: c)
+        let size = DisplayCaptureGeometry.outputSize(region: rect, pixelScale: pixelScale)
         options.sourceRect = c.windowID == nil ? rect : .zero
-        options.width = max(2, Int(width * scale))
-        options.height = max(2, Int(height * scale))
+        options.width = Int(size.width)
+        options.height = Int(size.height)
+        let display = c.displayID.map { CGDisplayBounds($0) } ?? .zero
+        let global = c.windowID == nil ? rect.offsetBy(dx: display.minX, dy: display.minY) : full
+        inputs?.setCaptureGeometry(CaptureGeometry(size: size, globalRect: global, tracksWindows: c.windowID == nil))
     }
 
-    private func configureScreen(_ c: StudioConfiguration, preserveFrame: Bool = false) async throws {
+    private func configureScreen(_ c: StudioConfiguration, preserveFrame: Bool = false, content: ShareableContentOnce? = nil) async throws {
         if let stream { try await stream.stopCapture(); self.stream = nil }
         let session = generation
         if !preserveFrame { inputs?.setScreen(nil) }
-        guard c.layout == .desktopChat else { return }
+        guard c.layout.showsDesktop else { return }
         guard CGPreflightScreenCaptureAccess() else { throw EngineError.message("Grant Screen Recording access in Settings before enabling screen capture") }
         guard let bridge else { throw EngineError.message("Capture is not initialized") }
-        let filter = try await captureFilter(c)
+        let filter = try await captureFilter(c, inputs: inputs, content: content)
         let options = SCStreamConfiguration()
-        setCaptureGeometry(options, rect: filter.contentRect, scale: CGFloat(filter.pointPixelScale), configuration: c)
+        setCaptureGeometry(options, rect: filter.contentRect, scale: CGFloat(filter.pointPixelScale), configuration: c, inputs: inputs)
         screenOptions = options; screenRect = filter.contentRect; screenScale = CGFloat(filter.pointPixelScale)
-        options.pixelFormat = kCVPixelFormatType_32BGRA; options.minimumFrameInterval = CMTime(value: 1, timescale: 30)
-        options.queueDepth = 3; options.showsCursor = true; options.capturesAudio = false
+        // The shield reads luma and keeps exact copies, so it takes 420f straight from the stream.
+        options.pixelFormat = c.privacyShieldEnabled ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange : kCVPixelFormatType_32BGRA
+        options.minimumFrameInterval = CMTime(value: 1, timescale: 30)
+        options.queueDepth = c.privacyShieldEnabled ? 4 : 3; options.showsCursor = true; options.capturesAudio = false
         let stream = SCStream(filter: filter, configuration: options, delegate: bridge)
         try stream.addStreamOutput(bridge, type: .screen, sampleHandlerQueue: bridge.queue)
         try await stream.startCapture()
@@ -652,7 +869,7 @@ final class StudioEngine: ObservableObject {
         var streams: [SCStream] { [system, reference].compactMap { $0 } }
     }
 
-    private func startAudioStreams(_ c: StudioConfiguration, inputs: RenderInputs, output: MediaOutput) async throws -> AudioStreams {
+    private func startAudioStreams(_ c: StudioConfiguration, inputs: RenderInputs, output: MediaOutput, content: ShareableContentOnce? = nil) async throws -> AudioStreams {
         var result = AudioStreams()
         let echo = needsEchoReference(c)
         guard c.systemAudioEnabled || echo else { return result }
@@ -663,7 +880,7 @@ final class StudioEngine: ObservableObject {
         output.echoReferenceCaptureFailure = nil
         do {
             if c.systemAudioEnabled {
-                let selection = try await audioCaptureFilter(c)
+                let selection = try await audioCaptureFilter(c, content: content)
                 let bridge = CaptureBridge(inputs: inputs, output: output, audioOnly: true, echoReference: shared)
                 let stream = SCStream(filter: selection.filter, configuration: audioStreamConfiguration(), delegate: bridge)
                 result.system = stream; result.systemBridge = bridge; result.applications = selection.applications
@@ -672,7 +889,7 @@ final class StudioEngine: ObservableObject {
                 try await stream.startCapture()
             }
             if echo && !shared {
-                let reference = await startEchoReference(c, inputs: inputs, output: output)
+                let reference = await startEchoReference(c, inputs: inputs, output: output, content: content)
                 result.reference = reference?.stream; result.referenceBridge = reference?.bridge
             }
             return result
@@ -682,14 +899,14 @@ final class StudioEngine: ObservableObject {
         }
     }
 
-    private func startEchoReference(_ c: StudioConfiguration, inputs: RenderInputs, output: MediaOutput) async -> (stream: SCStream, bridge: CaptureBridge)? {
+    private func startEchoReference(_ c: StudioConfiguration, inputs: RenderInputs, output: MediaOutput, content: ShareableContentOnce? = nil) async -> (stream: SCStream, bridge: CaptureBridge)? {
         var startedStream: SCStream?
         do {
             guard CGPreflightScreenCaptureAccess() else {
                 throw EngineError.message("Allow Screen Recording in Settings for echo cancellation")
             }
             var allApps = c; allApps.systemAudioApplicationID = ""
-            let selection = try await audioCaptureFilter(allApps)
+            let selection = try await audioCaptureFilter(allApps, content: content)
             let bridge = CaptureBridge(inputs: inputs, output: output, audioOnly: true, echoReference: true, referenceOnly: true)
             let stream = SCStream(filter: selection.filter, configuration: audioStreamConfiguration(), delegate: bridge)
             startedStream = stream
@@ -726,7 +943,7 @@ final class StudioEngine: ObservableObject {
         referenceStream = reference?.stream; referenceBridge = reference?.bridge
     }
 
-    private func configureSystemAudio(_ c: StudioConfiguration) async throws {
+    private func configureSystemAudio(_ c: StudioConfiguration, content: ShareableContentOnce? = nil) async throws {
         audioRevision &+= 1
         let revision = audioRevision
         let session = generation
@@ -737,7 +954,7 @@ final class StudioEngine: ObservableObject {
         if let oldReference { try await oldReference.stopCapture() }
         try ensureCurrent(session)
         guard let inputs, let output else { throw EngineError.message("Capture is not initialized") }
-        let audio = try await startAudioStreams(c, inputs: inputs, output: output)
+        let audio = try await startAudioStreams(c, inputs: inputs, output: output, content: content)
         guard session == generation, revision == audioRevision, !stopping else {
             for stream in audio.streams { try? await stream.stopCapture() }
             throw CancellationError()
@@ -765,11 +982,26 @@ final class StudioEngine: ObservableObject {
     }
 }
 
+/// Lets the screen and audio filters of one session start share a single ScreenCaptureKit
+/// enumeration; later updates still enumerate fresh.
+@MainActor
+final class ShareableContentOnce {
+    private var content: SCShareableContent?
+    static func content(_ shared: ShareableContentOnce?) async throws -> SCShareableContent {
+        guard let shared else { return try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false) }
+        if let content = shared.content { return content }
+        let fresh = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false)
+        shared.content = fresh
+        return fresh
+    }
+}
+
 /// Explicit private-window rules take precedence over the broad app visibility toggle.
 enum CaptureWindowPolicy {
     static func isVisible(windowID: CGWindowID, isOwnWindow: Bool, applicationExcluded: Bool,
                           configuration c: StudioConfiguration, annotationWindowID: CGWindowID?,
-                          teleprompterWindowIDs: Set<CGWindowID>) -> Bool {
+                          teleprompterWindowIDs: Set<CGWindowID>, cameraArrangeWindowID: CGWindowID? = nil) -> Bool {
+        if windowID == cameraArrangeWindowID { return false }
         if teleprompterWindowIDs.contains(windowID) {
             return c.teleprompterInCapture && !c.excludedWindowIDs.contains(windowID)
         }
@@ -800,7 +1032,7 @@ private final class CaptureBridge: NSObject, SCStreamOutput, SCStreamDelegate, @
         guard !audioOnly, type == .screen, let image = sample.imageBuffer,
               let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
               (attachments.first?[.status] as? NSNumber)?.intValue == SCFrameStatus.complete.rawValue else { return }
-        inputs.setScreen(image)
+        inputs.setScreen(image, captured: CMSampleBufferGetPresentationTimeStamp(sample).seconds)
     }
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         // A reference-only failure must not stop or mute the user's microphone.
@@ -858,7 +1090,12 @@ private final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBuffe
         } }
     }
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        if let image = sampleBuffer.imageBuffer { inputs.setCamera(image) }
+        guard let session, session.outputs.contains(where: { $0 === output }),
+              let clock = session.synchronizationClock, let image = sampleBuffer.imageBuffer else { return }
+        let hostTime = CMSyncConvertTime(CMSampleBufferGetPresentationTimeStamp(sampleBuffer),
+                                        from: clock, to: CMClockGetHostTimeClock())
+        guard hostTime.isNumeric else { return }
+        inputs.setCamera(image, captured: hostTime.seconds)
     }
     deinit { observers.forEach(NotificationCenter.default.removeObserver) }
 

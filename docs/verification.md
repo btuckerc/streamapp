@@ -1,5 +1,22 @@
 # Verification — 2026-09-20
 
+## Native 4:2:0 encoder input, session activity — 2026-10-24
+
+- `EncoderColorTests` renders seven sRGB colours into a 420v buffer with `VideoEncoder.colorAttachments`: every Y/Cb/Cr sample is within 1 of the BT.709 video-range formula (white 235/128/128, red 63/102/240). After adding the BT.709 transfer tag VideoToolbox puts on encoded buffers, `PreviewFrames.image(_:program:)` reads every colour back within 3 of the source.
+- A packaged ad-hoc `--smoke` recording (not installed) was compared with the same smoke built from the unchanged sources. The decoded frames at 0.3 s matched (median per-channel difference 0, mean 0.39; the moving synthetic marker accounts for the tail). Program-preview PNGs matched too (median 0, mean 0.6). Before the explicit-sRGB preview fix, the preview was brighter than the output (mean 4.0, e.g. 47/82 vs 42/72). ffprobe: H.264 High, yuv420p, tv range, bt709 primaries/transfer/matrix, 620 frames. `scripts/verify-media.py` reported no decode errors or duplicate timestamps.
+- During a packaged `--smoke` session, `pmset -g assertions` listed StreamApp's `PreventUserIdleSystemSleep` and `PreventUserIdleDisplaySleep` named "Recording or streaming"; after the smoke stopped, neither remained. Real sleep and thermal pressure were not exercised. `swift test` passed 73 tests.
+
+## Webcam placement — 2026-10-24
+
+- In the isolated `~/src/streamapp-work/webcam` Mac clone, `swift build` and `swift test` passed: 80 Swift Testing tests in 15 suites (the XCTest runner reports 0; these suites use Swift Testing). Eight new camera-placement tests cover legacy decode/anchor precedence, clamping, exact legacy corner rectangles across all frames, normal/punch sizes and chat arrangements, inverse round trips, independent 24 px snapping and Option bypass, cropped/letterboxed/global-display mapping, unconditional handle exclusion, cursor hysteresis/overlap/bypass, and stale-configuration drag acknowledgment with immediate transition cuts.
+- `python3 scripts/build-app.py --identity -` built an isolated ad-hoc bundle without installing. Packaged `--ui-smoke` and `--settings-smoke` each printed the ready marker and remained alive for three seconds. The harness then terminated and reaped only its exact child PID; these UI modes do not exit automatically. The user's installed/running StreamApp was not stopped or replaced.
+- Unverified interactively: pointer tracking/cursor feel, preview hit regions and snap guides, floating-panel placement on physical displays, Spaces/full-screen behavior, and actual capture exclusion. Unit tests exercise the mapping and fail-closed visibility policy, not ScreenCaptureKit's live WindowServer behavior. No new polling/timers were added for arrangement or cursor avoidance.
+
+## Voice ducking — 2026-09-24
+
+- `AudioMixerTests.duckingLowersAppAudioOnlyWhileSpeakingThenRecovers` runs every preset through the real mixer: 200 ms of −20 dBFS speech over constant app audio. It checks the depth 180 ms into speech, the hold 190 ms after speech, and one release time constant of recovery. Off leaves app audio at unity. Research and parameter sources are in `docs/architecture.md#voice-ducking-research--2026-09-24`.
+- Packaged `--settings-smoke` (not installed): Audio showed a Ducking section below Processing. Selecting Medium enabled its reset button and changed the caption to the −12 dB text. `swift test` passed 72 tests.
+
 ## Native Settings window — 2026-09-24
 
 - Settings used a SwiftUI `TabView` inside an `NSWindow` whose `.preference` toolbar style had no toolbar. The segmented tab control was drawn into the titlebar beside the traffic lights, adding vertical space and offsetting them, and it switched to Liquid Glass when clicked. `StudioSettingsController` (`NSTabViewController`, `.toolbar` tab style, `.preference` window) now provides the system preference toolbar, glass selection and per-pane window title. Pane switches have no crossfade, each pane's SwiftUI view loads when first selected, and all panes are 680 × 580 pt, so switching does not resize the window.
@@ -361,3 +378,186 @@ python3 scripts/verify-media.py PATH_TO_RECORDING --output .build/verification.j
 - Installed Companion applied and verified Annotate/Color/Stroke width/Clear and lower Middle / upper Secondary click on the connected Intuos BT S. Overlay remained Off. Physical pen hover behavior after remapping still needs a hardware press; synthetic input is not proof of it.
 - Final installed UI showed distinct named color swatches near the pointer; a native-input stroke appeared red and disappeared with the Clear shortcut. Companion's main screen and Apply dialog were visually checked after moving setup/details into collapsed sections.
 - Driver readback retained only global application association `0`, tip function `1`, lower function `2`, upper function `3`, Press-and-Tap `false`, and button overlay `false`.
+
+## Privacy shield slice — 2026-10-24
+
+Checked in the isolated `~/src/streamapp-work/privacy` Mac clone; no installation or user-app restart.
+
+- `swift build`: passed (debug build, 13.83 s). The clone emitted stale-build-root warnings and existing microphone weak-capture warnings.
+- `swift test`: **86 tests in 17 suites passed**, including real Vision fast-OCR recognition of CoreText-rendered fake AWS and `sk-proj-` credentials, packet delay/order/invalidation/fail-closed/keyframe/monotonicity checks, PCM exact delay/wrap/flush and redaction hold/merge/expansion checks. Earlier runs exposed test macro mutability errors, detector indexing/UUID false positives and OCR-inserted whitespace; these were repaired before the passing full run.
+- `python3 scripts/build-app.py --identity -`: passed, including the production build and ad-hoc bundle signing. The default signing identity is unavailable over SSH with the login keychain locked; Developer ID signing/notarization was not checked.
+- `StreamApp.app/Contents/MacOS/StreamApp --ui-smoke` and `--settings-smoke`: each printed `StreamApp ready — idle; no capture started` and survived five seconds without exiting/crashing. These existing modes do **not** self-terminate; a Python subprocess supervisor terminated only its own exact child PID afterward. This is a launch smoke, not visual UI inspection.
+- `StreamApp.app/Contents/MacOS/StreamApp --smoke .build/privacy-smoke --smoke-stage-seconds 1 --privacy-shield`: passed all five scene stages, clean delayed stop and restart with the default two-second shield delay. No device capture permission was required (synthetic sources).
+- `python3 scripts/verify-media.py .build/privacy-smoke/StreamApp-2026-10-24T00-31-40Z-F436E6D4.mp4 --output .build/privacy-media-0.json` and the corresponding second recording `StreamApp-2026-10-24T00-31-48Z-8B8012F4.mp4` / `.build/privacy-media-1.json`: full decode exit 0, no backwards DTS or duplicate PTS in either stream. An additional `ffprobe -v error -show_packets -show_entries packet=stream_index,pts_time,dts_time -of json <file>` check asserted strictly increasing PTS and DTS in packet order. First recording: 163 video / 255 audio packets, durations 5.454375 / 5.440000 s (14.375 ms difference). Restart: 90 video / 142 audio packets, durations 3.021375 / 3.021333 s (0.042 ms difference).
+
+Real-screen secret introduction/removal through the full encoder/muxer path, scan-overrun recovery in a live recording, sustained OCR power/memory cost, visual popover status/pixellation, real-device lip sync and WAN streaming remain unverified. OCR recall remains best-effort; passing synthetic fixtures is not a privacy guarantee.
+
+## Music-production audio slice — 2026-10-24
+
+Verified in the isolated `btc-mbp14:~/src/streamapp-work/audio` clone; no installation or authenticated broadcast:
+
+- `swift build` passed. `STREAMAPP_FFMPEG_PATH="$PWD/.build/ffmpeg/bin/ffmpeg" STREAMAPP_AUDIO_FIXTURE_VIDEO="$PWD/.build/audio-fixture.flv" swift test` passed **83 tests in 15 suites**, zero failures (final run 3.696 s).
+- Added consumer checks cover centered mono and stereo 3/4 selection from interleaved/planar four-channel PCM at 44.1/48/96 kHz, delivered-channel fallback, settings defaults/unknown values/round-trip, exact signed offsets for both sources, independent extreme-offset windows across ring wrap, AEC raw-time alignment, limiter-reduction peak hold, and timed silence/rejoin after microphone loss.
+- The first mapped interleaved fixtures exposed a Core Audio channel-map stride problem. A reusable same-rate planar layout stage corrected it; all six rate/layout cases then passed without weakening the expected channel values.
+- `.build/ffmpeg/bin/ffmpeg -buildconf` confirmed AAC, tee, FIFO, FLV, MP4/Matroska and the existing audio conversion filters. No FFmpeg component/configuration change was needed.
+- Fixture creation: `/opt/homebrew/bin/ffmpeg -hide_banner -nostdin -y -f lavfi -i color=c=black:s=320x180:r=30:d=1 -an -c:v h264_videotoolbox -f flv .build/audio-fixture.flv`. The **bundled minimal FFmpeg** then accepted the production `ffmpegArguments` against that video and native generated stereo PCM for both MP4 and MKV, including filenames with spaces, `|` and `'`. Both outputs were nonempty; each invocation exited zero. Logs showed one H.264 copy plus AAC 160/320 kb/s encodes. The essential Both-mode arguments were:
+
+```text
+-map 0:v -map 1:a -map 1:a -c:v copy -c:a aac
+-b:a:0 160k -b:a:1 320k -flags:a +global_header -shortest -f tee
+[f=mp4:movflags=+hybrid_fragmented:select=\'v:0,a:1\']RECORDING|
+[f=fifo:onfail=ignore:fifo_format=flv:queue_size=120:drop_pkts_on_overflow=1:attempt_recovery=1:recover_any_error=1:recovery_wait_time=1:restart_with_keyframe=1:select=\'v:0,a:0\']STREAM
+```
+
+- `python3 scripts/build-app.py --identity -` passed (local ad-hoc signing, no `--install`; the SSH login keychain is locked). `StreamApp.app/Contents/MacOS/StreamApp --ui-smoke` and `--settings-smoke` each printed `StreamApp ready — idle; no capture started` and stayed alive for a five-second launch check. These modes are persistent inspection windows, not self-exiting tests; a Python subprocess wrapper terminated only its own exact child PID after each check.
+
+Unverified: physical multichannel-interface delivery, Bluetooth/default-route warning transitions, physical disconnect/reconnect and runtime-error recovery, camera/interface clap sync at maximum offsets, actual Ableton main/cue routing, AAC decoded true peaks, provider delivery, and multi-hour independent-clock behavior. Synthetic rejoin tests establish mixer timing, not hardware recovery. The optional additional instrument/loopback source is **not implemented**; neither drift correction nor isolated recording tracks are claimed.
+
+## Merged audio audit repairs — 2026-10-24
+
+The merged candidate reserves lookahead for configured negative offsets even when a source starts disabled, and retains mic/SCK/reference capture until the existing bounded audio/Privacy shield drain finishes. The writer's PCM delay ring, frozen audio target and parent-owned FFmpeg timestamp preservation remain intact; no new polling was introduced.
+
+Verified on `btc-mbp14` in `~/src/streamapp-work/merged`:
+
+- `swift build` passed (2.84 s).
+- Recreated `.build/audio-fixture.flv` with `/opt/homebrew/bin/ffmpeg -hide_banner -nostdin -y -f lavfi -i color=c=black:s=320x180:r=30:d=1 -an -c:v h264_videotoolbox -f flv .build/audio-fixture.flv`.
+- `STREAMAPP_FFMPEG_PATH="$PWD/.build/ffmpeg/bin/ffmpeg" STREAMAPP_AUDIO_FIXTURE_VIDEO="$PWD/.build/audio-fixture.flv" swift test` passed **108 tests in 20 suites**, zero failures (3.920 s). New regressions exercise initially disabled advanced mic/app sources, stable 600 ms playout and 26-packet video queue after live enable, and real post-stop samples covering the final advanced interval with both zero and three-second privacy delays.
+- `python3 scripts/build-app.py --identity -` passed; no installation.
+- `StreamApp.app/Contents/MacOS/StreamApp --smoke /tmp/x` passed and exited zero, including clean stop/restart.
+- `StreamApp.app/Contents/MacOS/StreamApp --smoke /tmp/y --privacy-shield` passed and exited zero, including delayed-tail stop/restart.
+
+These are synthetic/pure-logic checks, not physical mic/interface/SCK capture qualification at −500 ms. Hardware tail-content and live device-enable behavior remain unverified.
+
+## Integrated candidate and timestamp preservation — 2026-10-24
+
+- Webcam placement, Privacy shield, music-production audio and the encoder/session-activity changes were merged into one tree. In a Mac clone of that tree, `swift test` passed 108 tests in 20 suites. An ad-hoc bundle (not installed) passed `--smoke` and `--smoke --smoke-stage-seconds 2 --privacy-shield`. `verify-media.py` decoded all four MP4s with exit 0 and no errors; ffprobe showed audio and video starting at 0 with durations within 16 ms.
+- `-copyts` throwaway check: H.264 in an FLV whose first packet is at 1.2 s, muxed with zero-based PCM. Default arguments moved video to 0 in MP4/Matroska (0.021 s in FLV), putting it 1.2 s ahead of audio. With `-copyts`, Matroska video started at 1.200 s and FLV at 1.221 s. MP4 held the first frame from 0 and its second packet was at 1.254 s. Audio started at 0 in every output.
+- `PrivacyScanner` hides the whole recognized line when Vision cannot return a box for a detected substring; previously that detection was dropped. This is a code change without a separate fixture.
+- Real-screen check of the installed app (`--bench --privacy-shield`, 10 s, main display, TextEdit showing fake AWS/OpenAI keys at 32 pt). Frames were extracted at 5 fps and read with Vision accurate OCR. The AKIA key was pixellated from the first frame. The `aws_secret_access_key` value and the `sk-proj-` key stayed readable for the 0.8 s the window was in front. Cause: fast OCR returned `aws_sec ret_access_key` and its value as separate observations, and read TextEdit's spell-check dots as periods (`s.k-p.ro.i-Q2xh…`). `\bsecret` also could not match inside `aws_secret_access_key`.
+- Fix: credential keywords now match inside identifiers, and an observation ending in a credential label also hides the nearest observation to its right on the same row. An offline harness (throwaway) drew eight `.env`/JSON/shell lines in Menlo, ran the scanner's fast-OCR settings and the shipped detector, and applied the same-row rule. It covered 1920×1080 at 35 px and 15 px, and 3024×1964 at 26 px. Every secret value was hidden in all three, and the prose control line was not. With imitation spell-check dots, Vision returned no text for most lines, and `DB PASSWORD=` was read as `DB PASSWORD-`. Those cases stay unredacted. `swift test`: 111 tests passed. The real-screen run was not repeated after the fix.
+
+## Video Effects, shrinking redactions, wrapped secrets, censor style — 2026-10-24
+
+- **Video Effects:** a throwaway bundle called `AVCaptureDevice.showSystemUserInterface(.videoEffects)` with no camera session open, and no panel appeared. The button sat in Capture → Camera, which is disabled while a session or preview runs, so it was clickable only when macOS would ignore it. It moved to Settings → Layout → Scene and is enabled from `StudioEngine.cameraOpen`. In `--settings-smoke` (demo, camera off), the Layout row showed **Open…** disabled with the availability caption, and Capture → Camera showed only Camera and Mirror. The panel opening with a live camera was not checked.
+- **Shrinking coverage:** `redactionsHoldEachDetectionAndShrinkAfterMovement` drives a detection that moves (a two-second trail covering both positions, then only the new one), text shrinking inside existing coverage (no generation bump, box shrinks after the hold) and expiry.
+- **Wrapped secrets:** a throwaway Vision test rendered a dark-terminal `cat .env` in Menlo at 18, 22, 26 and 30 pt, with a long `typesafe_api_key=` hex value and an `OPENROUTER_API_KEY=sk-or-v1-…` value wrapped at the right edge, followed by `NODE_ENV=production`. It ran `PrivacyScanner.recognize`. Before the continuation rule accepted OCR-inserted spaces, fast OCR read wrapped lines as `314dd2e2f 204544170ab` and `56789abcd2f e583c291`, and they stayed visible. After the change, every wrapped continuation line was covered at all four sizes, and `NODE_ENV=production` was not. At 30 pt, fast OCR read the first line as `typesaf e_api key-7f 3a9c…` (`=` as `-`, spaces inside the hex), so that first line stayed unredacted, as it was before this change.
+- **Censor style:** `everyCensorStyleHidesTheSourceCompletely` renders each style (solid, rounded, striped) in near-black, white and red over random noise and over white. Inside the cover, the pixels are identical for both sources and differ from the noise.
+- Mac clone: `swift test` passed 113 tests in 20 suites. An ad-hoc bundle passed `--smoke --smoke-stage-seconds 2 --privacy-shield`. `--settings-smoke` Output → Privacy shield showed Censor style (Solid bar) and Censor color (0.06 grey) with reset buttons, disabled while the shield is off. A real-screen moving-window recording was not made.
+
+## Render-late privacy shield — 2026-10-24
+
+- **Diagnosis** of a user recording (`StreamApp-2026-10-24T01-39-35Z-39B6A955.mp4`, previous build). Video froze because `PrivacyDelayQueue` dropped packets and waited for keyframes when coverage changed. Bars far wider than the text came from width-proportional padding, merging across rows and screen-space hold trails left at old window positions. The secret cut at its underscore because only the value (capture group 1) was matched, and fast OCR read `_` as a space and `=` as `-`.
+- **Mac clone, final candidate:** `swift test` passed **125 tests in 21 suites**. They cover:
+  - owner-local placement during drags without trails or guards;
+  - carry through a move for as long as it lasts, dropped once a still window's pixels change;
+  - the lifecycle guard: a window leaving the list stays covered at its scanned position, and every changed pixel is guarded until a later scan ends the transition;
+  - a scan bracket wider than the normal spacing guarding what only its interior showed;
+  - idle preview covering changes since the newest scan and never showing a screen its plan does not describe;
+  - exact-first ownership;
+  - change, overrun and pool-gap guards;
+  - capture-time history and stale-epoch rejection;
+  - delayed camera;
+  - every censor style hiding an interior box and one clipped at the source corner;
+  - whole-assignment, OCR-misread, label and wrap detection;
+  - the band OCR path:
+    - Vision band reads must place a rendered credential where a whole-image read does (this confirmed region-relative results are projected correctly);
+    - bands must never cut cached text and must fall back to a whole-image read when too large;
+    - band growth must terminate when rounding leaves a reached boundary "near" text.
+- **Release audit** (`omp-audit`, auditor, GPT-6.1 Sol xhigh): two BLOCK verdicts, the initial audit and its one allowed recheck. All six findings were fixed afterwards. No further audit has passed this candidate, so the release boundary holds: it is not installed.
+  - First audit:
+    1. A failed scan between two clean scans left text shown only around it unguarded.
+    2. After a geometry reset, idle preview showed the raw live screen with an empty plan. It now renders only the frame its plan describes.
+    3. Band growth could reassign the same boundary forever. A Double simulation of the auditor's counterexample (text maxY 0.49999999999999994, change at y 560 of 1000) looped before the fix and ended at [0.376, 0.508] after it. Growth now requires a strict outward move.
+  - Recheck:
+    1. A slow (overrunning) scan widens the bracket the same way as a failure. The first fix's failure marker was replaced by one rule: a bracket wider than interval + 0.1 s guards every tile of its interior frames that differs from the later scan.
+    2. Idle preview ignored changes since its newest scan, including during scan failures. It now guards tiles changed since that scan.
+    3. Rounded covers clipped at the capture edge rounded away corners over detected text. The shape now extends past each source edge it touches.
+
+  The new timeline, preview and censor-corner tests were not run against the old code.
+- **Ad-hoc bundle, final candidate:** `--smoke --smoke-stage-seconds 2 --privacy-shield` printed `SMOKE PASS: live scenes, chat toggle, camera toggle, audio controls, clean stop and restart` (synthetic sources) on all three builds. `--settings-smoke` printed its ready marker on the pre-audit build. The caption, now reworded to 0.35 s, was not inspected visually. `strings` found no probe markers in the pre-audit binary.
+- **Real-screen e2e** on the MBP's main display (1662×1080 capture, a dark text-dense chat app in front). `--bench --bench-seconds 14 --bench-no-system-audio --privacy-shield`, plus a throwaway window showing a fake `.env` (`typesafe_api_key=` with a wrapped hex value, `OPENROUTER_API_KEY=sk-or-v1-…`, `aws_secret_access_key = …`, `NODE_ENV=production`). The window is still for 2 s, dragged for 3 s, still for 1.5 s, dragged back fast, still, then closed. Each run checks:
+  - leaks: every one of the 421 decoded frames, OCR-scanned for any secret fragment;
+  - coverage: the fraction of non-black pixels at the censor luma, sampled at 2 fps;
+  - CPU: 12 `ps` samples.
+
+  Each MP4 had 421 packets over 14.02 s, with no gap above 40 ms after the first-frame offset.
+  - **Teardown leak (fixed):** one full scan of an earlier build found the whole window uncovered in one frame at close. It was listed as gone while drawn at a new position. The lifecycle guard fixed it.
+  - **Fast-drag leak (fixed):** with a one-scan carry limit, 2 of 8 runs leaked the `aws_secret_access_key` rows for one frame mid-drag. A probe showed fast OCR missed those rows in two consecutive mid-drag scans; the carry dropped them at the second, which was itself the rendered frame. With carry for the whole move: 0 leaks in 5 + 3 + 3 + 1 + 1 + 1 full runs. The last three were on probe-free builds before the audit, after the first fixes, and after the recheck fixes:
+
+    | Run | Cover median | Cover p90 | CPU median |
+    |---|---|---|---|
+    | After first fixes | 16.7% | 20.8% | ~35.6% |
+    | After recheck fixes | 16.1% | 21.3% | ~40.5% |
+
+    Contact sheets showed covered rows mid-drag, no trails and no whole-screen cover. During the final run's fast drag back, one frame showed a solid guard over the window and part of the adjacent chat text.
+  - **Coverage:** this screen's dark UI puts 14.5% median / 14.8% p90 of pixels in the censor luma range with the shield off. Shielded: 15.9–18.5% median, 20.6–23.0% p90. Teardown spikes of 0.53–0.88 lasted one 0.5 s sample, and none appeared in the last three runs (max 0.26). Contact sheets showed covers on the window's rows during and after drags with no trails. Some spill remains where OCR merges a window row with adjacent background text.
+  - **CPU** (median of 12 samples): shield off 12.6–13.4%.
+
+    | Build | CPU median |
+    |---|---|
+    | Whole-image OCR at 5 Hz | ~45% |
+    | Shield pipeline with Vision stubbed out (attribution only) | ~22% |
+    | Band OCR at 5 Hz | ~40% |
+    | Band OCR at 4 Hz, final | 35–43% |
+
+    The agreed gate (shield off +15 points, about 28%) **was not met**. Every scan sees changed pixels: the menu-bar clock and extras, a blinking caret, and the capture's bottom 8 rows, which differ at scattered x in every frame (cause not established). Band reads take 15–65 ms (avg ~44) against ~82 ms for a whole image, because Vision has a fixed cost per request. Window drags take whole-image reads by design.
+  - **Rejected experiment:** a pixel-anchored tracker (`PrivacyTracker`) also had 0 leaks, but covered 26% median / 40.5% p90 of the frame with drag trails at 48.6% CPU. Its first cut covered 99.5% of the screen because accurate-OCR model compilation never finished. It was removed.
+  - An earlier probe measured fast OCR at 33–122 ms per scan, with results ready 40–146 ms after capture, within the 0.5 s delay. Before guards were capped at eight, 100–140 guard rects made composition take ~70 ms, and the session stopped with "Video timing fell behind".
+- **Not verified:** camera history with a physical camera (bench and smoke disable it or use synthetic sources); physical camera/audio lip-sync under the delay; streaming output; long-session memory; other screen contents, scales or displays.
+
+## Privacy shield accuracy and atlas rescans — 2026-10-24
+
+- **Underscore cut (user report):** a recording from the installed (previous) build showed a `typesafe_api_key` cover ending at the `_`, with the rest of the value visible. Fast OCR reads `_` as a space and `=` as `-`, which ended the credential match inside its value. The detector now hides a credential from its start to the end of its OCR line, also matching confusion-tolerant variants (symbols read as token characters; look-alike digits read as letters, without whitespace). `hidesAnOCRLineFromItsCredentialToTheEnd` includes a first-row key with `_` before its hex tail, and the same key ending at `_`.
+- **Offline accuracy harness** (throwaway, removed): 80 rendered `.env`-style cases across fonts, sizes and wraps, scanned with the shipped fast-OCR settings and detector and then compared cell by cell. Uncovered secret cells went from 409 to 11; 3 of 80 cases still leak. Every remaining leak is the last ≤ 5 characters of the wrapped `OPENROUTER_API_KEY` value on its own row (JetBrains Mono, 16 px), which fast OCR returns no text for. Changing `VNRecognizeTextRequest.revision` (1/2/3) changed neither accuracy nor CPU (~47–49 ms per whole-image call).
+- **Correction:** the earlier per-frame "23.5 ms" `changedTiles` overhead was a debug-build figure. In release, the row-first comparison takes 0.12 ms on an identical 1662×1080 frame (0.78 ms before the change).
+- **Atlas rescans:** in the release build on the MBP, still-screen scans went from ~35–45 ms (one request per band) to ~6–20 ms wall (one request for all regions). Reusing a `VNRecognizeTextRequest` or `VNSequenceRequestHandler` saved nothing in a throwaway test: Vision creates its recognizer on every perform. Rigid window-move reuse was built and removed: on this scaled capture (1512×982 points to 1662×1080 pixels) the pixel-exact move check never matched in a probe, and tolerance matching was rejected as unsafe for low-contrast text.
+- **Mac clone, final candidate:** `swift test` passed 127 tests in 21 suites, including atlas reads placing two rendered credentials where a whole-image read does, region growth/containment, outline strips not covering a window's centre, the 60% fallback and growth termination after rounding. Release bundle built without `--install`.
+- **Real-screen e2e** (same harness as above: `--bench --bench-seconds 14 --bench-no-system-audio --privacy-shield`, MBP main display, dark text-dense chat app in front). The throwaway window (960×260, MesloLGS NF 18) shows a fake `typesafe_api_key=tsk_…N2_97252…` whose `_` and hex tail sit on the first visual row before it wraps, plus `OPENROUTER_API_KEY`, `aws_secret_access_key` and `NODE_ENV=production`. The leak scan OCRs every decoded frame for every 5-character window of each secret value; its self-test reads all three rendered secret rows.
+  - Positive control, shield off: the key rows were found in ~110 frames.
+  - Shield on, drag timeline: 0 leaking frames of 421 on each of two builds (probe and final), no video gap above 40 ms after the first-frame offset. Pixels at the censor luma (2 fps samples): 0% before the window opens and after it closes, so this desktop had none of its own; median 5.1%, p90 5.8%, max 19.3% (one sample) of visible pixels overall. Contact sheet and full-resolution crops showed every secret row covered past the `_`, mid-drag and still, no trails and no whole-screen cover; on the `aws_secret_access_key` row the cover spilled left of the window onto adjacent chat text.
+  - Shield on, still window (same window, no drag): 0 leaking frames of 421.
+  - **CPU** (median of 12 `ps` samples, final build): shield off, still window 13.0%; shield on, still window 28.5%; shield on, drag timeline 30.6%. Previous candidate: 35–43%. The ≤ 26% target was not met; still-window use sits at the 28% ceiling and drags exceed it. A probe build attributed the remaining cost to OCR of real screen changes: every scan saw changed pixels (another app's live output, clock, caret), with small-region scans at ~10–20 ms wall each and dragged-window scans (up to ~50% of the image) at ~40–50 ms. In a `sample` profile of the drag run, Vision text recognition was ~18 of ~29 sampled on-CPU points of a core; the scanner's own work ~4, capture ~3, composition ~3.
+- Ad-hoc release bundle: `--smoke --smoke-stage-seconds 2 --privacy-shield` printed `SMOKE PASS: live scenes, chat toggle, camera toggle, audio controls, clean stop and restart`.
+- Real-screen recordings, frames and screenshots were deleted after these checks. The candidate was not installed: a release audit has not passed it.
+
+## Privacy shield tracking, capture format, pointer splits — 2026-10-24
+
+- **Pointer split (user report: "the area under the cursor gets uncensored"):** harness scenarios draw an arrow pointer over the secret rows, either sweeping (`cursor-arrow-sweep`) or resting and jumping every 20 frames (`cursor-arrow-rest`, `cursor-arrow-bare-rest` over bare `ghp_`/`sk-proj`/`xoxb` tokens). Before the fix, `cursor-arrow-rest` leaked 16 frames (32 character-frames): the pointer split OCR's row into `OPENROUTER_API_KEY=sk-or-v1-a` and the rest of the value, and only the two pieces were covered, leaving the cells under the pointer gap (x 627–642) uncovered. A line hidden after its label or a credential line it continues now spans from its anchor's right edge. After the fix, all four pointer scenarios leaked 0 frames, with benign over-cover of 3.35%, 0.59%, 0% (`bare`, no pointer) and 1.60%. `SensitiveTextDetectorTests` gained a pointer-split case; the existing label/continuation expectations now include the bridged gap.
+- **Compositor crash (found in the e2e drag bench, two reports in `~/Library/Logs/DiagnosticReports`):** `EXC_BREAKPOINT` on `streamapp.compositor`, "Double value cannot be converted to Int32 because it is either infinite or NaN" in `PrivacyMotionTracker.place`. `ScanResult.carry` shrank a carried rectangle by 2 pixels vertically; a sliver under 4 pixels tall (clipped by a front window or the capture edge) became `CGRect.null`, whose infinite origin then trapped. A first fix (carry the found rectangle ∩ its visible part) made a test of a front window leaving a 1-row sliver, then a third scan, pass; against the old code that test crashed the test process. The release audit then found that storing only the sliver loses the row once the front window moves away (below), so carry now keeps the whole found row; the test became `carryKeepsTheWholeFoundRowWhileAFrontWindowLeavesASliver`, which also expects the full row back after the front window leaves. It was not re-run against the original code.
+- **Tracker cost:** the sparse signature's rows, columns and values are built once with each patch, not per search. Instrumentation of the drag bench showed moving windows never matched beyond the nearest 8 rows, so they search only that radius. A window's horizontal registration probe runs once per frame, and a failed probe is reused rather than repeated per detection. All instrumentation was removed; no `ZZ` markers remain in sources or tests.
+- **420f capture:** with the shield on, both capture streams deliver 420f, and the history pool copies planes exactly (no CIContext conversion). A shield-on and a shield-off frame of the same screen matched in a visual comparison and in mean colour over a reference region.
+- **Vision probes:** fast recognition runs on the CPU only. Accurate recognition costs about twice the CPU. Vision reloads its recognizer on every request regardless of request reuse. Vision settings are unchanged.
+- **Release audit `PrivacyShieldCursor`: BLOCK, five findings, all addressed in this candidate:**
+  - *F5, carry stores a sliver:* carry keeps the whole found row with its patch offset (test above).
+  - *F4, neighbour-origin covers clipped to the current bounds:* each candidate origin is clipped against the window as listed at that origin. `unresolvedNeighborOriginIsClippedToTheWindowListedThere` failed before the fix and passes after.
+  - *F1, failed or overrunning scan unguarded; F3, window moving and closing unguarded:* changed-tile guards (architecture: "Changed-tile guards") fire only when evidence is missing: no predecessor, no successor by the deadline, a bracket wider than 0.35 s, or a sensitive window gone from a later list. Tests: `missingOrOverWideEvidenceGuardsWhatNoScanRead`, `aSensitiveWindowLeavingTheListGuardsWhatChangedAnywhere`. `guardMaskCoversExactlyItsTilesHowEverFragmented` renders more than 140 checkerboard tiles on a 410×200 source: every tile is the censor colour (±1), every other pixel is unchanged.
+  - *F2, idle preview shows new text indefinitely while scans fail:* once the newest scan is more than 0.5 s old on the host clock, idle preview guards everything changed since it. `idlePreviewGuardsChangesOnlyOnceItsNewestScanPassesTheDeadline` replaces the earlier idle-preview test.
+- **Harness** (`PrivacyEvaluation`, replacement policy, 58 scenarios, guards counted as covers): most rows are identical to the run before the guards. Guarded scenarios had these benign over-cover rates: `thrown-scan` 6.81%, `nil-scan` 2.02%, `early-owner-gone` 3.51%, deadline-after 12.47%. `scroll-phase-1`…`-7` benign rose (`scroll-phase-7` 8.16% → 10.15%). `wide-interior-only` fell from 2376 to 1474 leaking character-frames (22 frames, benign 25.11%). A debug print showed that the remaining cells are a metric artifact: each leaking cell's box reaches 4 pixels into an unchanged tile above it, which holds no new text. The other leaks are unchanged known limits: `scroll-pixel-fast` 3, `scroll-reversal` 2, `flash-1`/`-2`/`-3` 1/2/3 frames (text shown for 1–3 frames between on-time scans).
+- **Release audit recheck `PrivacyShieldCursorRecheck` (candidate sha 03b112c2…): BLOCK, two findings, both fixed afterwards.** In both, the window list clipped a found cover, which exposed text that the dense check had just verified in the shown pixels:
+  - a window listed 10 rows above its pixels clipped the cover's last rows;
+  - a front window listed before it was drawn removed the cover entirely.
+
+  Found and carried placements are now clipped only to the capture bounds; unresolved candidates keep owner and front-window clipping. `aSecretFoundBetweenScansIsCoveredWhereverTheListPutsWindows` (both counterexamples) and `foundAndCarriedCoversFollowThePixelsNotAFrontWindowListedOverThem` (which replaces the sliver test) failed against the recheck candidate with 3 issues and pass with the fix. Effect on the full harness: no leak or benign-cover count changed. Mean covered area rose by at most 0.0005 of the frame (`scroll-repeated`), and `two-windows` max rectangles fell from 7 to 6.
+- **Mac clone, final:** `swift test` passed **136 tests in 23 suites**. On the rebuilt bundle, the privacy-shield smoke printed `SMOKE PASS` and the three UI smokes printed `StreamApp ready — idle; no capture started`.
+- **Mac clone, recheck candidate:** `swift test` passed **135 tests in 23 suites**. The release bundle was built without `--install`. `--smoke --smoke-stage-seconds 2 --privacy-shield` printed `SMOKE PASS: live scenes, chat toggle, camera toggle, audio controls, clean stop and restart`. `--ui-smoke`, `--settings-smoke` and `--onboarding-smoke` each printed `StreamApp ready — idle; no capture started` and were stopped after 120 s. Their windows were not inspected visually.
+- **Real-screen e2e** (same bench and throwaway `.env` window as the previous section): 9 interleaved runs (shield off, still, drag) × 3 all logged `stopped`. No new crash report appeared. The leak scan of a drag recording found 0 leaking frames of 421, and no gap above 40 ms after the first-frame offset (start offset 0.054 s).
+  - A temporary stderr probe in `unreadReference` (since removed) counted guarded frames. One drag run and one still run each guarded 7 frames, all of them consecutive frames right after the window closed (window gone from the successor's list). No frame during the drag or the still period was guarded.
+  - Cover share (pixels at the censor luma, 2 fps samples of a drag recording): median 4.9%, p90 9.8%, max 10.0%.
+  - Still frames cover exactly the secret rows; `$ cat .env` and `NODE_ENV=production` stay visible. Mid-drag frames cover about one text row more above and below. That matches the unresolved-placement row padding (`uncertainRows`, one row pitch); no guard fired then. The attribution was not instrumented.
+- **CPU** (`ps` %CPU, 12 samples per run; means of 3 interleaved reps; load average 4–5 from the user's own apps):
+
+  | Run | Shield off | Shield on, still | Shield on, drag |
+  |---|---|---|---|
+  | Rep 1 | 11.6% | 22.7% | 27.1% |
+  | Rep 2 | 11.1% | 20.6% | 25.8% |
+  | Rep 3 | 10.7% | 22.1% | 26.3% |
+
+  Raw samples, rep 1–3:
+  - Off: `17.7 12.8 8.9 10.6 7.4 10.9 9.9 12.7 12.2 11.5 12.4 11.9`; `14.2 12.4 9.4 9.7 8.8 10.9 10.2 12.9 11.4 11.5 11.2 10.1`; `15.2 10.1 7.7 9.5 9.3 10.2 8.9 12.8 10.9 12.1 9.5 11.7`.
+  - Still: `24.5 21.6 32.8 17.3 19.7 21.1 22.4 21.9 17.8 21.8 19.3 32.2`; `22.2 14.8 32.6 13.9 17.1 13.3 20.2 19.8 25 20.8 21.2 25.7`; `18.5 18.9 29.1 19.9 17.2 22.4 23.9 22.9 22.5 23.7 23 23.3`.
+  - Drag: `17.1 21.6 35.5 18.8 32.1 28.6 35.7 23.4 30.9 32.7 21.5 27.8`; `15.7 18 34.2 18.5 28.9 28.2 31.3 20.5 32.4 32.7 22.9 25.7`; `18.2 22.4 33.1 16.9 28.9 29.3 28.4 26.8 32.5 27.2 28.1 23.6`.
+
+  The build before the guards measured 22.1–22.6% still and 25.5–26.7% drag under similar load. The previous section's build measured 28.5% still and 30.6% drag.
+- **Final build, drag run:** a drag run logged `stopped` with no new crash report. The leak scan found 0 leaking frames of 421 (start offset 0.054 s). Cover share was median 4.9%, p90 9.4%, max 9.8%. CPU was 25.7% (mean of `23.6 16.8 19 21 42.6 24.2 35 25 24.7 33.9 20 22.4`).
+- Real-screen recordings, frames and screenshots were deleted after these checks. The candidate is not installed: the one allowed recheck returned BLOCK, so installing it needs another audit.
+

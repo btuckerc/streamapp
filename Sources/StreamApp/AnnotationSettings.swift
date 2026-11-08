@@ -35,6 +35,7 @@ final class AnnotationSettings: ObservableObject {
     static let defaultFillColor = NSColor.clear
     static let defaultHoldToStraighten = true
     static let defaultEraseMode: AnnotationEraseMode = .object
+    static let defaultPenActions: [Int: AnnotationPenAction] = [1: .tools, 2: .straighten]
 
     @Published var smoothing: Double {
         didSet { let clamped = Self.clamp(smoothing, to: 0...1); if smoothing != clamped { smoothing = clamped }; persistValue(smoothing, forKey: Self.smoothingKey) }
@@ -88,7 +89,7 @@ final class AnnotationSettings: ObservableObject {
         strokeWidth = Self.clamp(savedWidth?.doubleValue ?? Self.defaultStrokeWidth, to: 1...24)
         holdToStraighten = defaults.object(forKey: Self.holdToStraightenKey) as? Bool ?? Self.defaultHoldToStraighten
         eraseMode = defaults.string(forKey: Self.eraseModeKey).flatMap(AnnotationEraseMode.init(rawValue:)) ?? Self.defaultEraseMode
-        var loaded: [Int: AnnotationPenAction] = [1: .tools, 2: .straighten]
+        var loaded = Self.defaultPenActions
         if let saved = defaults.dictionary(forKey: Self.penActionsKey) as? [String: String] {
             let sanitized = saved.reduce(into: [Int: AnnotationPenAction]()) { result, pair in
                 guard let button = Int(pair.key), (1...31).contains(button),
@@ -96,7 +97,7 @@ final class AnnotationSettings: ObservableObject {
                 result[button] = action
             }
             if !saved.isEmpty && sanitized.isEmpty {
-                loaded = [1: .tools, 2: .straighten]
+                loaded = Self.defaultPenActions
             } else {
                 loaded = sanitized
             }
@@ -117,8 +118,14 @@ final class AnnotationSettings: ObservableObject {
         persistPenActions()
     }
     func restorePenDefaults() {
-        penActions = [1: .tools, 2: .straighten]
+        penActions = Self.defaultPenActions
         persistPenActions()
+    }
+    var penActionsAreDefault: Bool { penActions == Self.defaultPenActions }
+    /// Stored colors are plain sRGB while defaults are dynamic system colors, so compare components.
+    static func sameColor(_ a: NSColor, _ b: NSColor) -> Bool {
+        guard let x = rgbaComponents(a), let y = rgbaComponents(b) else { return a.isEqual(b) }
+        return abs(x.red - y.red) < 0.002 && abs(x.green - y.green) < 0.002 && abs(x.blue - y.blue) < 0.002 && abs(x.alpha - y.alpha) < 0.002
     }
 
     func restoreDefaults() {
@@ -126,7 +133,7 @@ final class AnnotationSettings: ObservableObject {
         strokeColor = Self.defaultStrokeColor; highlighterColor = Self.defaultHighlighterColor; fillColor = Self.defaultFillColor
         holdToStraighten = Self.defaultHoldToStraighten
         eraseMode = Self.defaultEraseMode
-        penActions = [1: .tools, 2: .straighten]
+        penActions = Self.defaultPenActions
         persistPenActions()
     }
 

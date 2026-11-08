@@ -4,10 +4,14 @@ import Carbon.HIToolbox
 /// Owns the application's global Carbon hot keys and routes them by hot-key ID.
 @MainActor
 final class StudioShortcuts {
-    enum Registration: String { case annotation, cameraPunchIn, transcriptNext, transcriptPrevious }
+    enum Registration: String { case annotation, cameraPunchIn, cameraArrange, session, scene, transcriptNext, transcriptPrevious }
 
     var onAnnotation: (() -> Void)?
     var onCameraPunchIn: (() -> Void)?
+    var onCameraArrange: (() -> Void)?
+    var onSession: (() -> Void)?
+    /// ⌃⌥⌘1–4: the scene at that index of `SceneLayout.allCases`.
+    var onScene: ((SceneLayout) -> Void)?
     var onTranscriptNext: (() -> Void)?
     var onTranscriptPrevious: (() -> Void)?
     var onRegistrationFailure: ((Registration, OSStatus) -> Void)?
@@ -57,10 +61,20 @@ final class StudioShortcuts {
         guard status == noErr else {
             onRegistrationFailure?(.annotation, status)
             onRegistrationFailure?(.cameraPunchIn, status)
+            onRegistrationFailure?(.cameraArrange, status)
+            onRegistrationFailure?(.session, status)
+            onRegistrationFailure?(.scene, status)
             return
         }
         register(keyCode: UInt32(kVK_ANSI_D), id: 1, registration: .annotation)
         register(keyCode: UInt32(kVK_ANSI_V), id: 2, registration: .cameraPunchIn)
+        register(keyCode: UInt32(kVK_ANSI_M), id: 5, registration: .cameraArrange)
+        register(keyCode: UInt32(kVK_ANSI_R), id: 6, registration: .session)
+        // IDs 10…13 follow the menu's scene order.
+        let sceneKeys = [kVK_ANSI_1, kVK_ANSI_2, kVK_ANSI_3, kVK_ANSI_4]
+        for (index, key) in sceneKeys.prefix(SceneLayout.allCases.count).enumerated() {
+            register(keyCode: UInt32(key), id: UInt32(10 + index), registration: .scene)
+        }
     }
 
     private func register(keyCode: UInt32, id: UInt32, registration: Registration, modifiers: UInt32 = UInt32(controlKey | optionKey | cmdKey)) {
@@ -96,6 +110,9 @@ final class StudioShortcuts {
         case 2: onCameraPunchIn?()
         case 3: onTranscriptNext?()
         case 4: onTranscriptPrevious?()
+        case 5: onCameraArrange?()
+        case 6: onSession?()
+        case 10..<(10 + UInt32(SceneLayout.allCases.count)): onScene?(SceneLayout.allCases[Int(id - 10)])
         default: return OSStatus(eventNotHandledErr)
         }
         return noErr
