@@ -18,7 +18,10 @@ import sys
 import tempfile
 
 # Writes status before closing the stream, so the reader's EOF implies the status file exists.
-SHELL = 'out=$1 status=$2; shift 2; exec 3>"$out"; "$@" >&3 2>&3; echo $? > "$status"; exec 3>&-'
+# The job then unloads itself, so even a SIGKILLed caller leaves nothing loaded once it finishes.
+SHELL = ('job=$1 out=$2 status=$3; shift 3; exec 3>"$out"; "$@" >&3 2>&3; echo $? > "$status"; exec 3>&-; '
+         'exec launchctl bootout "$job"')
+SIGNALS = {signal.SIGALRM, signal.SIGTERM, signal.SIGHUP}
 
 
 def run(args, cwd=None, timeout=3600, sink=None):
@@ -41,7 +44,7 @@ def run(args, cwd=None, timeout=3600, sink=None):
         job.write_bytes(plistlib.dumps({
             'Label': label, 'RunAtLoad': True, 'ProcessType': 'Interactive',
             'WorkingDirectory': str(cwd or os.getcwd()), 'EnvironmentVariables': env,
-            'ProgramArguments': ['/bin/sh', '-c', SHELL, 'sh', str(out), str(status), *map(str, args)],
+            'ProgramArguments': ['/bin/sh', '-c', SHELL, 'sh', f'{domain}/{label}', str(out), str(status), *map(str, args)],
         }))
         # Handlers go in before bootstrap so a timeout, SSH hangup or kill still unloads the job.
         previous = {number: signal.signal(number, handler) for number, handler in
@@ -57,10 +60,15 @@ def run(args, cwd=None, timeout=3600, sink=None):
                         sink(text)
             code = int(status.read_text())
         finally:
+            # A signal arriving now must not interrupt cleanup; it is delivered after the job is unloaded.
+            signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)
             signal.alarm(0)
             subprocess.run(['launchctl', 'bootout', f'{domain}/{label}'], capture_output=True)
+            if signal.SIGALRM in signal.sigpending():
+                signal.sigwait({signal.SIGALRM})  # a stale timeout; the job is already gone
             for number, handler in previous.items():
                 signal.signal(number, handler)
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, SIGNALS)
     return code, ''.join(chunks)
 
 
