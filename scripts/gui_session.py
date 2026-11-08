@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import plistlib
 import secrets
+import socket
 import subprocess
 import sys
 import tempfile
@@ -31,11 +32,19 @@ except ProcessLookupError:
     pass
 subprocess.run(['launchctl', 'bootout', job])
 '''
+# Streams stdin to the caller's socket. A connection made before the caller accepts waits in the backlog.
+SEND = '''
+import socket, sys
+connection = socket.socket(socket.AF_UNIX)
+connection.connect(sys.argv[1])
+while data := sys.stdin.buffer.read1(65536):
+    connection.sendall(data)
+'''
 # Status is written before the stream closes, so the caller's EOF implies the status file exists
 # unless the job was stopped. The job then unloads itself, which also ends the watcher.
-SHELL = ('python=$1 caller=$2 job=$3 timeout=$4 out=$5 status=$6; shift 6; '
+SHELL = ('python=$1 caller=$2 job=$3 timeout=$4 sock=$5 status=$6; shift 6; '
          '"$python" -c "$WATCH" "$caller" "$job" "$timeout" & '
-         'exec 3>"$out"; "$@" >&3 2>&3; echo $? > "$status"; exec 3>&-; exec launchctl bootout "$job"')
+         '{ "$@"; echo $? > "$status"; } 2>&1 | "$python" -c "$SEND" "$sock"; exec launchctl bootout "$job"')
 
 
 def run(args, cwd=None, timeout=3600, sink=None):
@@ -45,21 +54,25 @@ def run(args, cwd=None, timeout=3600, sink=None):
         raise FileNotFoundError(cwd)
     job = f'gui/{os.getuid()}/dev.streamapp.gui-session.{os.getpid()}.{secrets.token_hex(4)}'
     chunks = []
-    with tempfile.TemporaryDirectory(prefix='gui-session.') as tmp:
-        out, status, plist = Path(tmp, 'out'), Path(tmp, 'status'), Path(tmp, 'job.plist')
-        os.mkfifo(out, 0o600)
+    with tempfile.TemporaryDirectory(prefix='gui-session.') as tmp, socket.socket(socket.AF_UNIX) as server:
+        sock, status, plist = Path(tmp, 'sock'), Path(tmp, 'status'), Path(tmp, 'job.plist')
+        server.bind(str(sock))  # the 0700 temporary directory keeps other users out
+        server.listen(1)
+        server.settimeout(timeout)  # accept() can never outwait a job the watcher already removed
         env = {k: v for k, v in os.environ.items() if not k.startswith('SSH_')}
-        env['WATCH'] = WATCH
+        env.update(WATCH=WATCH, SEND=SEND)
         plist.write_bytes(plistlib.dumps({
             'Label': job.rsplit('/', 1)[1], 'RunAtLoad': True, 'ProcessType': 'Interactive',
             'WorkingDirectory': str(cwd), 'EnvironmentVariables': env,
             'ProgramArguments': ['/bin/sh', '-c', SHELL, 'sh', sys.executable, str(os.getpid()), job,
-                                 str(timeout), str(out), str(status), *map(str, args)],
+                                 str(timeout), str(sock), str(status), *map(str, args)],
         }))
         subprocess.run(['launchctl', 'bootstrap', job.rsplit('/', 1)[0], str(plist)], check=True)
         try:
-            with open(out, 'rb') as stream:
-                for chunk in iter(lambda: stream.read1(65536), b''):
+            connection, _ = server.accept()
+            with connection:
+                connection.settimeout(None)  # the watcher's deadline ends the job, which closes the stream
+                for chunk in iter(lambda: connection.recv(65536), b''):
                     text = chunk.decode(errors='replace')
                     chunks.append(text)
                     if sink:
