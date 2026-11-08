@@ -9,6 +9,8 @@ import shutil
 import subprocess
 import tempfile
 
+import gui_session
+
 ROOT = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser()
 parser.add_argument('--identity', help='Optional Apple signing identity; defaults to the local pin or - for an ad-hoc build')
@@ -40,6 +42,18 @@ def run(*args):
         return subprocess.check_output(args, cwd=ROOT, text=True, stderr=subprocess.STDOUT)
     except subprocess.CalledProcessError as error:
         raise SystemExit(error.output.rstrip() or f'{args[0]} failed ({error.returncode})') from error
+
+def sign(*args):
+    """codesign; over SSH the login keychain is unavailable, so retry in the GUI session."""
+    try:
+        return run('codesign', *args)
+    except SystemExit as error:
+        if 'errSecInternalComponent' not in str(error):
+            raise
+    code, output = gui_session.run(['codesign', *args], cwd=ROOT)
+    if code:
+        raise SystemExit(output.rstrip() or f'codesign failed ({code})')
+    return output
 
 
 # Local builds need no certificate; retain an existing pin unless explicitly overridden.
@@ -107,8 +121,8 @@ info = {
     'CFBundleName': 'StreamApp', 'CFBundleDisplayName': 'StreamApp',
     'CFBundleIdentifier': 'dev.streamapp.studio', 'CFBundleExecutable': 'StreamApp',
     'CFBundlePackageType': 'APPL',
-    'CFBundleShortVersionString': a.version if a.release else '1.3.1',
-    'CFBundleVersion': a.build_number if a.release else '10',
+    'CFBundleShortVersionString': a.version if a.release else '1.4.0',
+    'CFBundleVersion': a.build_number if a.release else '11',
     'CFBundleIconFile': 'StreamApp.icns',
     'LSMinimumSystemVersion': '26.0', 'LSUIElement': True, 'NSHighResolutionCapable': True,
     'NSCameraUsageDescription': 'StreamApp uses the camera you enable in your broadcast layout.',
@@ -150,9 +164,9 @@ shutil.copytree(ffmpeg_notices, licenses / 'FFmpeg')
 helper_signing = ['--options', 'runtime'] if a.identity != '-' else []
 if a.release:
     helper_signing = ['--timestamp', '--options', 'runtime']
-run('codesign', '--force', '--sign', a.identity, *helper_signing, str(macos / 'ffmpeg'))
+sign('--force', '--sign', a.identity, *helper_signing, str(macos / 'ffmpeg'))
 app_signing = ['--timestamp', '--options', 'runtime'] if a.release else ['--options', 'runtime']
-run('codesign', '--force', '--sign', a.identity, *app_signing, '--entitlements', str(entitlements), str(staging))
+sign('--force', '--sign', a.identity, *app_signing, '--entitlements', str(entitlements), str(staging))
 run('codesign', '--verify', '--deep', '--strict', str(staging))
 if a.identity != '-':
     requirement = subprocess.run(['codesign', '-d', '-r-', str(staging)], text=True, capture_output=True, check=True)

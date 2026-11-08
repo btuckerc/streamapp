@@ -38,7 +38,7 @@ Release mode requires an installed **Developer ID Application** certificate and 
 ```sh
 python3 scripts/build-app.py --release \
   --identity "Developer ID Application: Your Name (TEAMID)" \
-  --version 1.3.1 --build-number 10 --output /absolute/path/StreamApp.app
+  --version 1.4.0 --build-number 11 --output /absolute/path/StreamApp.app
 ```
 
 The output path must not already exist. `scripts/build-ffmpeg.py` builds a minimal, static, LGPLv3 FFmpeg command-line tool containing only what StreamApp uses (FLV/PCM input, H.264 stream copy, AAC encoding, MP4/Matroska/tee/FIFO/FLV output, file/RTMP/RTMPS with statically linked OpenSSL). Its exact configuration, source checksum and licenses are recorded in the app; redistribution requires corresponding source and applicable license notices. A nonfree FFmpeg configuration is refused.
