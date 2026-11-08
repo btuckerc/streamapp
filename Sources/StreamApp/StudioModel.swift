@@ -159,6 +159,7 @@ final class StudioModel: ObservableObject {
     private var deviceSubscription: AnyCancellable?
     private var audioRouteObserver: AudioInputRouteObserver?
     private var devicesLoaded = false
+    private var deviceRefreshQueued = false
     private var deviceGeneration = 0
     private var pendingUpdate = false
     private var loading = true
@@ -198,7 +199,7 @@ final class StudioModel: ObservableObject {
             deviceSubscription = NotificationCenter.default.publisher(for: AVCaptureDevice.wasConnectedNotification)
                 .merge(with: NotificationCenter.default.publisher(for: AVCaptureDevice.wasDisconnectedNotification))
                 .receive(on: DispatchQueue.main)
-                .sink { [weak self] _ in self?.refreshDevices() }
+                .sink { [weak self] _ in self?.scheduleDeviceRefresh() }
         }
         twitchSubscription = twitch.$account.dropFirst().sink { [weak self] account in
             guard let self, account == nil, self.engine.isRunning,
@@ -329,14 +330,26 @@ final class StudioModel: ObservableObject {
         refreshDevices()
     }
 
+    /// One route change fires several HAL listeners and AVCaptureDevice notifications;
+    /// everything already queued on main lands in a single refresh.
+    private func scheduleDeviceRefresh() {
+        guard devicesLoaded, !deviceRefreshQueued else { return }
+        deviceRefreshQueued = true
+        DispatchQueue.main.async { [weak self] in
+            MainActor.assumeIsolated {
+                self?.deviceRefreshQueued = false
+                self?.refreshDevices()
+            }
+        }
+    }
+
     private func refreshDevices() {
         guard devicesLoaded else { return }
         deviceGeneration &+= 1
         let generation = deviceGeneration
         if !demo {
-            audioRouteObserver = AudioInputRouteObserver { [weak self] in
-                Task { @MainActor in self?.refreshDevices() }
-            }
+            if let audioRouteObserver { audioRouteObserver.sync() }
+            else { audioRouteObserver = AudioInputRouteObserver { [weak self] in self?.scheduleDeviceRefresh() } }
         }
         Task.detached(priority: .userInitiated) { [weak self] in
             let cameras = StudioEngine.cameras(), microphones = StudioEngine.microphones()

@@ -50,27 +50,54 @@ enum AudioInputRoutes {
     }
 }
 
-/// Property listeners are removed with their owner. A list change rebuilds the
-/// subscription via StudioModel's existing coalesced device refresh generation.
-final class AudioInputRouteObserver: @unchecked Sendable {
-    private var listeners: [(AudioObjectID, AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] = []
-    init(changed: @escaping @Sendable () -> Void) {
-        func observe(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector, scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal) {
-            var address = AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: kAudioObjectPropertyElementMain)
-            let block: AudioObjectPropertyListenerBlock = { _, _ in changed() }
-            if AudioObjectAddPropertyListenerBlock(object, &address, .main, block) == noErr { listeners.append((object, address, block)) }
+/// Long-lived HAL route listeners, registered once per object. Never rebuild these per
+/// notification: on macOS 27 each AudioObjectRemovePropertyListenerBlock leaves residue in the
+/// object's listener list, so add/remove churn grows every later add/remove until the main
+/// thread spends all its time scanning that list. `sync()` only touches devices that appeared
+/// or vanished. Callbacks run on main; the owner coalesces bursts into one refresh.
+@MainActor
+final class AudioInputRouteObserver {
+    private typealias Listener = (address: AudioObjectPropertyAddress, block: AudioObjectPropertyListenerBlock)
+    private let changed: () -> Void
+    private var listeners: [AudioObjectID: [Listener]] = [:]
+
+    init(changed: @escaping @MainActor () -> Void) {
+        self.changed = changed
+        let system = AudioObjectID(kAudioObjectSystemObject)
+        listeners[system] = [observe(system, kAudioHardwarePropertyDefaultInputDevice),
+                             observe(system, kAudioHardwarePropertyDevices)].compactMap { $0 }
+        sync()
+    }
+
+    /// Adds listeners for new devices and drops vanished ones; present devices are untouched.
+    func sync() {
+        let system = AudioObjectID(kAudioObjectSystemObject)
+        let current = Set(AudioInputRoutes.devices)
+        for (object, registered) in listeners where object != system && !current.contains(object) {
+            for listener in registered { remove(object, listener) }
+            listeners[object] = nil
         }
-        observe(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyDefaultInputDevice)
-        observe(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyDevices)
-        for device in AudioInputRoutes.devices {
-            observe(device, kAudioDevicePropertyStreamConfiguration, scope: kAudioDevicePropertyScopeInput)
-            observe(device, kAudioDevicePropertyTransportType)
+        for device in current where listeners[device] == nil {
+            listeners[device] = [observe(device, kAudioDevicePropertyStreamConfiguration, scope: kAudioDevicePropertyScopeInput),
+                                 observe(device, kAudioDevicePropertyTransportType)].compactMap { $0 }
         }
     }
-    deinit {
-        for (object, address, block) in listeners {
-            var address = address
-            AudioObjectRemovePropertyListenerBlock(object, &address, .main, block)
+
+    private func observe(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector,
+                         scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal) -> Listener? {
+        var address = AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: kAudioObjectPropertyElementMain)
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            MainActor.assumeIsolated { self?.changed() }
         }
+        return AudioObjectAddPropertyListenerBlock(object, &address, .main, block) == noErr ? (address, block) : nil
+    }
+
+    private func remove(_ object: AudioObjectID, _ listener: Listener) {
+        var address = listener.address
+        AudioObjectRemovePropertyListenerBlock(object, &address, .main, listener.block)
+    }
+
+    isolated deinit {
+        for (object, registered) in listeners { for listener in registered { remove(object, listener) } }
     }
 }
