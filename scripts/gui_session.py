@@ -31,6 +31,9 @@ def run(args, cwd=None, timeout=3600, sink=None):
         raise TimeoutError(f'{args[0]} did not finish in the GUI session within {timeout} s '
                            '(is the user logged in at the Mac?)')
 
+    def interrupted(number, _):
+        raise SystemExit(128 + number)
+
     with tempfile.TemporaryDirectory(prefix='gui-session.') as tmp:
         out, status, job = Path(tmp, 'out'), Path(tmp, 'status'), Path(tmp, 'job.plist')
         os.mkfifo(out, 0o600)
@@ -40,10 +43,12 @@ def run(args, cwd=None, timeout=3600, sink=None):
             'WorkingDirectory': str(cwd or os.getcwd()), 'EnvironmentVariables': env,
             'ProgramArguments': ['/bin/sh', '-c', SHELL, 'sh', str(out), str(status), *map(str, args)],
         }))
-        subprocess.run(['launchctl', 'bootstrap', domain, str(job)], check=True)
-        previous = signal.signal(signal.SIGALRM, expired)
-        signal.alarm(timeout)
+        # Handlers go in before bootstrap so a timeout, SSH hangup or kill still unloads the job.
+        previous = {number: signal.signal(number, handler) for number, handler in
+                    ((signal.SIGALRM, expired), (signal.SIGTERM, interrupted), (signal.SIGHUP, interrupted))}
         try:
+            subprocess.run(['launchctl', 'bootstrap', domain, str(job)], check=True)
+            signal.alarm(timeout)
             with open(out, 'rb') as stream:
                 for chunk in iter(lambda: stream.read1(65536), b''):
                     text = chunk.decode(errors='replace')
@@ -53,8 +58,9 @@ def run(args, cwd=None, timeout=3600, sink=None):
             code = int(status.read_text())
         finally:
             signal.alarm(0)
-            signal.signal(signal.SIGALRM, previous)
             subprocess.run(['launchctl', 'bootout', f'{domain}/{label}'], capture_output=True)
+            for number, handler in previous.items():
+                signal.signal(number, handler)
     return code, ''.join(chunks)
 
 
